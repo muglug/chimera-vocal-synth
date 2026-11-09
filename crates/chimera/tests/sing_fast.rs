@@ -164,10 +164,11 @@ fn diphthongs_glide_and_melismas_lead_only_when_asked() {
     let change = |p: &Plan| pitches(p).iter().map(|x| x.0).filter(|t| *t > 1.2).fold(f64::MAX, f64::min);
     assert!((change(&plain) - 1.5).abs() < 1e-9 && (change(&styled) - 1.44).abs() < 1e-9, "plain {} styled {}", change(&plain), change(&styled));
     assert!(pitches(&styled).iter().any(|x| (x.1 - 1.44).abs() < 1e-9), "the old note's pitch should end at 1.44: {:?}", pitches(&styled));
-    // a consonant that sounds its pitch is led too: the l of "life", back up to F#4, has its
-    // pitch 60 ms before it starts; and both sides of each move are quick
+    // a consonant that sounds its pitch is led too, by the size of the move: the l of "life",
+    // a semitone back up to F#4, has its pitch a quarter of the 60 ms before it starts (a third
+    // or more would have all of it); and both sides of each move are quick
     let l = |p: &Plan| p.segments.iter().find(|s| s.ipa == "l").cloned().unwrap();
-    let early = 0.06;
+    let early = 0.015;
     let starts = |p: &Plan, t: f64| p.gestures.iter().any(|g| g.label.as_ref().is_some_and(|x| x.as_str() == "pitch") && (g.t0 - t).abs() < 1e-9);
     assert!(starts(&plain, l(&plain).t0) && starts(&styled, l(&styled).t0 - early) && !starts(&styled, l(&styled).t0));
     // a stop or a voiceless consonant hides the move and is not led: "tie" in place of "life"
@@ -184,5 +185,74 @@ fn diphthongs_glide_and_melismas_lead_only_when_asked() {
         if (g.t1 - 1.44).abs() < 1e-9 || (g.t1 - (l(&styled).t0 - early)).abs() < 1e-9 {
             assert!(g.ramp_out <= 0.03 + 1e-9, "lets go over {}", g.ramp_out);
         }
+    }
+}
+
+/// Shaded vowels: the vowel's own gesture aims between its articulation and the other vowel's,
+/// all the way at 1, and nothing else in the plan changes.
+#[test]
+fn a_shaded_vowel_is_sung_towards_another() {
+    use chimera::anatomy::human::ArticKey;
+    use chimera::phonetics::planner::vowel_artic;
+    use std::collections::BTreeMap;
+    let base = SongOptions { body: "male".into(), bpm: 60.0, t0: 1.0, vibrato: 0.0, ..Default::default() };
+    let (notes, _, plain) = sing("dee bah", 1.0, 60.0);
+    let shade = |w: f64| plan_song(&notes, &SongOptions { t0: 0.5, vowels: Some(BTreeMap::from([("i".to_string(), ("y".to_string(), w))])), ..base.clone() });
+    let lips = |p: &Plan, v: &str| p.gestures.iter().find(|g| g.label.as_ref().is_some_and(|l| l.as_str() == v)).unwrap().targets.get(ArticKey::LipProt).unwrap();
+    let (i, y) = (vowel_artic("i", "male".into()).unwrap(), vowel_artic("y", "male".into()).unwrap());
+    let (i, y) = (i.get(ArticKey::LipProt).unwrap(), y.get(ArticKey::LipProt).unwrap());
+    assert!(y > i + 0.1, "y should be rounder than i: {y} against {i}");
+    assert!((lips(&plain, "i") - i).abs() < 1e-12);
+    assert!((lips(&shade(1.0), "i") - y).abs() < 1e-12);
+    assert!((lips(&shade(0.5), "i") - 0.5 * (i + y)).abs() < 1e-12);
+    // the other vowel, the consonants and every time are as they were
+    let (a, b) = (shade(1.0), plain);
+    assert_eq!(a.segments, b.segments);
+    assert_eq!(a.gestures.len(), b.gestures.len());
+    for (g, h) in a.gestures.iter().zip(&b.gestures) {
+        assert_eq!((g.t0, g.t1, g.ramp_in, g.ramp_out), (h.t0, h.t1, h.ramp_in, h.ramp_out));
+        if g.label.as_ref().is_some_and(|l| l.as_str() != "i") {
+            assert_eq!(g.targets.0.map(f64::to_bits), h.targets.0.map(f64::to_bits));
+        }
+    }
+}
+
+/// Vibrato that grows: nothing for the delay, then steps of rising depth up to the song's, held
+/// to the end of the note; a short note only gets as far as it lasts.
+#[test]
+fn vibrato_grows_through_a_held_vowel_when_asked() {
+    use chimera::phonetics::sing::VibratoGrowth;
+    let depth = |p: &Plan| p.gestures.iter().filter(|g| g.label.as_ref().is_some_and(|l| l.as_str() == "vibrato")).map(|g| (g.t0, g.t1, g.targets.get(ControlKey::VIBRATO).unwrap())).collect::<Vec<_>>();
+    // one "bah" for two seconds from 0.5 s (its vowel starts on the beat), then one for 0.4 s
+    let (notes, _, plain) = sing("bah", 2.0, 60.0);
+    assert_eq!(depth(&plain).len(), 1, "plain: one vibrato gesture at the full depth");
+    let grows = SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 40.0, vibrato_grows: Some(VibratoGrowth { delay: 0.1, over: 0.8 }), ..Default::default() };
+    let steps = depth(&plan_song(&notes, &grows));
+    assert!(steps.len() >= 6, "{steps:?}");
+    // from the delay on, without a gap, each deeper than the last, ending on the full depth
+    assert!((steps[0].0 - 0.6).abs() < 1e-9, "starts at {}", steps[0].0);
+    assert!(steps.windows(2).all(|w| (w[1].0 - w[0].1).abs() < 1e-9 && w[1].2 > w[0].2), "{steps:?}");
+    assert!(steps[0].2 < 4.0 && (steps.last().unwrap().2 - 40.0).abs() < 1e-9, "{steps:?}");
+    assert!(steps.last().unwrap().1 > 2.3, "held to the end of the vowel: {steps:?}");
+    // 0.4 s: it gets a third of the way
+    let short = depth(&plan_song(&[SungNote { beats: 0.4, ..notes[0].clone() }], &grows));
+    let top = short.last().unwrap().2;
+    assert!(!short.is_empty() && top > 4.0 && top < 20.0, "{short:?}");
+}
+
+/// Sung consonants are 0.8 of their spoken lengths unless the song says otherwise.
+#[test]
+fn consonant_length_scales_the_sung_consonants() {
+    let (notes, _, plain) = sing("strut strut", 2.0, 60.0);
+    let half = plan_song(&notes, &SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, consonant_length: Some(0.4), ..Default::default() });
+    let cons = |p: &Plan| p.segments.iter().filter(|s| s.kind != "vowel").map(|s| s.t1 - s.t0).collect::<Vec<_>>();
+    let (a, b) = (cons(&plain), cons(&half));
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert!((y / x - 0.5).abs() < 1e-9, "{x} became {y}");
+    }
+    // and the vowels still land on their beats
+    for (x, y) in vowel_onsets(&half.segments).iter().zip(vowel_onsets(&plain.segments)) {
+        assert!((x - y).abs() < 1e-9, "{x} against {y}");
     }
 }

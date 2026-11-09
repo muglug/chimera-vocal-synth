@@ -3,7 +3,7 @@
 use crate::js::{fixed, num, pad_end, pad_start};
 use crate::{Ctx, FS, arg, body, body_mix, peak, repo_path, wav_name};
 use chimera::analysis::lpc::{FormantOpts, estimate_formants};
-use chimera::anatomy::human::{ArticKey, BodyMix, N_ARTIC};
+use chimera::anatomy::human::{ArticKey, ArticPatch, BodyMix, N_ARTIC};
 use chimera::analysis::pitch::{YinOpts, yin_pitch};
 use chimera::control::beat_player::BeatPlayer;
 use chimera::control::score::Gesture;
@@ -18,8 +18,8 @@ use chimera::phonetics::planner::{
     PhraseInput, PlanOptions, expand, plan_phrases, plan_utterance, vowel_table,
 };
 use chimera::phonetics::sing::{
-    Diphthongs, LegatoFrom, NoteOnOptions, SongOptions, SungNote, midi_to_hz, plan_note_off,
-    plan_note_on, plan_song,
+    Diphthongs, LegatoFrom, NoteOnOptions, SongOptions, SungNote, VibratoGrowth, midi_to_hz,
+    plan_note_off, plan_note_on, plan_song,
 };
 use chimera::phonetics::songs::DEMO_SONGS;
 use chimera::phonetics::syllables::lyrics_to_syllables;
@@ -594,7 +594,7 @@ fn plan_line(j: &serde_json::Value, g: &EnglishG2P, body_name: &str, t0: f64, be
 }
 
 /// Sing a melody: `{"bpm", "lyrics", "notes": [[midi, beats], ...], "t0"?, "vibrato"?, "source"?,
-/// "speech"?, "speechSource"?, "diphthongs"?, "pitchLead"?, "pitchFollow"?, "pronounce"?}` (`pronounce`: see
+/// "speech"?, "speechSource"?, "diphthongs"?, "pitchLead"?, "pitchFollow"?, "vowels"?, "vibratoGrows"?, "posture"?, "pronounce"?}` (`pronounce`: see
 /// [`g2p_saying`]; the caller loads it). One lyric syllable per sounding note; a note with midi <= 0 is a rest, which
 /// splits the melody into phrases planned separately on one voice. `source` sets the vocal folds
 /// for the singing (a `SourcePatch`: tension, breathiness, brightness, pressure, roughness...),
@@ -604,8 +604,11 @@ fn plan_line(j: &serde_json::Value, g: &EnglishG2P, body_name: &str, t0: f64, be
 /// voice: the vocal folds go back to the engine's default for a line, with `speechSource` over
 /// it (`{"pressure": 13}` projects the line over other singers: at the default 8 cmH2O speech is
 /// some 9 dB under the singing), and to the sung source after it.
-/// `diphthongs` (`{"glide": 0.5, "open": "ɑ"}`) and `pitchLead` (seconds) are the song
-/// planner's options of those names (`SongOptions`): diphthongs that glide over the last part of
+/// `diphthongs` (`{"glide": 0.5, "open": "ɑ"}`), `pitchLead` (seconds), `vowels`
+/// (`{"i": ["y", 0.9]}`: each vowel shaded towards another) and `vibratoGrows` (`{"delay": 0.1,
+/// "over": 0.8}`: vibrato that comes in through the note) are the song planner's options of
+/// those names (`SongOptions`), as is `consonantLength`; `posture` (`{"epilarynx": 1}`) is the singer's resting
+/// articulation, for what no sung sound moves: diphthongs that glide over the last part of
 /// their note, from a darker vowel, and notes whose pitch is there as they start. `pitchFollow`
 /// (seconds) is how closely the voice follows the written pitch (`HumanVoice::pitch_follow`, 0.03
 /// unless set). Together, less of a swoop between notes: a lead of 0.05 and a follow of 0.012.
@@ -623,6 +626,15 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         _ => None,
     };
     let pitch_lead = j["pitchLead"].as_f64();
+    let consonant_length = j["consonantLength"].as_f64();
+    let vowels: Option<std::collections::BTreeMap<String, (String, f64)>> = match j.get("vowels") {
+        Some(d) if !d.is_null() => Some(serde_json::from_value(d.clone()).map_err(|e| format!("vowels: {e}"))?),
+        _ => None,
+    };
+    let vibrato_grows: Option<VibratoGrowth> = match j.get("vibratoGrows") {
+        Some(d) if !d.is_null() => Some(serde_json::from_value(d.clone()).map_err(|e| format!("vibratoGrows: {e}"))?),
+        _ => None,
+    };
     let syl = lyrics_to_syllables(j["lyrics"].as_str().ok_or("lyrics missing")?, g);
     let sounding = raw.iter().filter(|n| n[0] > 0.0).count();
     if syl.len() != sounding {
@@ -643,6 +655,16 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
     v.set_source(&SourcePatch { f0: None, voiced: None, ..source });
     if let Some(follow) = j["pitchFollow"].as_f64() {
         v.pitch_follow = follow;
+    }
+    // the singer's resting posture: what no sung sound moves stays there for the whole melody
+    // (the epilarynx: narrowed, it gathers the voice's energy around 3 kHz, a trained singer's ring)
+    if let Some(serde_json::Value::Object(posture)) = j.get("posture") {
+        let mut patch = ArticPatch::default();
+        for (name, x) in posture {
+            let key = ArticKey::from_name(name).ok_or(format!("posture: no articulator {name:?}; have {}", ArticKey::NAMES.join(", ")))?;
+            patch.set(key, x.as_f64().ok_or(format!("posture: {name} is not a number"))?);
+        }
+        v.set_articulation(&patch, None);
     }
     // the spoken lines, and where the vocal folds change for them (lines close together share
     // one stretch of the speaking voice)
@@ -689,7 +711,7 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         if phrase.is_empty() {
             return;
         }
-        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, diphthongs: diphthongs.clone(), pitch_lead });
+        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, diphthongs: diphthongs.clone(), pitch_lead, vowels: vowels.clone(), vibrato_grows, consonant_length });
         v.schedule(&plan.gestures);
         *end = js_max(*end, plan.end);
         phrase.clear();
@@ -816,7 +838,7 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         let body_name = v["body"].as_str().unwrap_or("male");
         body(body_name)?;
         let mut melody = serde_json::json!({"bpm": bpm, "t0": t0, "lyrics": v["lyrics"], "notes": v["notes"]});
-        for k in ["vibrato", "source", "speech", "speechSource", "diphthongs", "pitchLead", "pitchFollow"] {
+        for k in ["vibrato", "source", "speech", "speechSource", "diphthongs", "pitchLead", "pitchFollow", "vowels", "posture", "vibratoGrows", "consonantLength"] {
             if let Some(x) = v.get(k) {
                 melody[k] = x.clone();
             }

@@ -13,7 +13,9 @@
 
 use super::inventory::{Manner, Voicing, phoneme};
 use crate::anatomy::human::BodyMix;
-use super::planner::{PlanOptions, diphthong_parts, is_vowel, plan_utterance};
+use super::planner::{PlanOptions, artic_targets, diphthong_parts, is_vowel, plan_utterance, vowel_artic};
+use crate::anatomy::human::ArticPatch;
+use std::collections::BTreeMap;
 use super::{Intonation, Plan, PlannedSegment, Segment, Syllable};
 use crate::control::score::{ControlKey, Gesture, Targets};
 use crate::math::{js_max, js_min};
@@ -104,6 +106,60 @@ pub struct SongOptions {
     /// word (a quaver's neighbour note at a fast tempo) is over before its pitch is heard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pitch_lead: Option<f64>,
+    /// vowels sung as another colour: a vowel → the vowel it is shaded towards and how far
+    /// (0 itself … 1 the other), its articulation the weighted mean of the two. A choir's
+    /// rounded, covered vowels are the front vowels most of the way to their rounded
+    /// neighbours: `{"i": ["y", 0.9], "ɛ": ["œ", 0.9]}`. The keys are the vowels as planned
+    /// (a diphthong's two parts, after `diphthongs.open`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vowels: Option<BTreeMap<String, (String, f64)>>,
+    /// vibrato that grows through the note, as a singer's does once the vowel has opened. None:
+    /// it is at its full depth from the note's start (the blend lets any gesture's target
+    /// through at once), on vowels over 0.3 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vibrato_grows: Option<VibratoGrowth>,
+    /// how long sung consonants are, as a share of their spoken lengths. None: 0.8. At a fast
+    /// tempo that leaves a short note mostly consonant (an f is 88 ms, and a swung quaver at 168
+    /// to the minute is 119): a singer's are nearer 0.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consonant_length: Option<f64>,
+}
+
+/// How a held vowel's vibrato comes in: none for `delay` seconds, then growing over `over`
+/// seconds to the song's depth, which it keeps to the note's end. A shorter note gets as far as
+/// it lasts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibratoGrowth {
+    pub delay: f64,
+    pub over: f64,
+}
+
+/// the growing vibrato is made of gestures this long (s), each a little deeper than the last
+const VIBRATO_STEP: f64 = 0.12;
+
+/// A vowel's growing vibrato from t0 to t1: a run of overlapping gestures, each on the depth the
+/// growth has reached at its middle and cross-fading with its neighbours over a whole step, so
+/// the depth rises smoothly. (One gesture cannot grow: the voice takes a gesture's target nearly
+/// whole as soon as the gesture has any weight.)
+fn growing_vibrato(t0: f64, t1: f64, depth: f64, grow: VibratoGrowth, out: &mut Vec<Gesture>) {
+    let (from, over) = (t0 + js_max(0.0, grow.delay), js_max(VIBRATO_STEP, grow.over));
+    let reached = |t: f64| {
+        let x = js_min(1.0, js_max(0.0, (t - from) / over));
+        depth * (0.5 - 0.5 * crate::math::cos(crate::math::PI * x))
+    };
+    let mut a = from;
+    while a + VIBRATO_STEP <= t1 {
+        // the last step holds what has been reached to the end of the note
+        let last = a + 2.0 * VIBRATO_STEP > t1 || a + VIBRATO_STEP >= from + over;
+        let b = if last { t1 } else { a + VIBRATO_STEP };
+        let at = if last { js_min(t1, from + over) } else { a + 0.5 * VIBRATO_STEP };
+        out.push(Gesture::new(a, b, js_min(VIBRATO_STEP, js_max(0.01, a - t0)), if last { 0.06 } else { VIBRATO_STEP }, 4.0, Targets::default().with(ControlKey::VIBRATO, reached(at))).label("vibrato"));
+        if last {
+            break;
+        }
+        a = b;
+    }
 }
 
 /// A sung diphthong that glides: "life" as laaa-iife rather than lah-if.
@@ -161,15 +217,16 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
         // segments to reshape once planned: a gliding diphthong's first vowel and how long the
         // move to its second takes, and the first segment of each note whose pitch leads it
         let mut glides: Vec<(usize, f64)> = Vec::new();
-        let mut led: Vec<(usize, bool, f64)> = Vec::new();
+        let mut led: Vec<(usize, bool, f64, f64)> = Vec::new();
         // and the hums, which hold their closure a little past their span
         let mut hums: Vec<usize> = Vec::new();
         // each note's onset and coda consonants, at the note's pitch (a coda at the pitch of the
         // note whose syllable it ends; a melisma has neither)
         let hz_of = |k: usize| midi_to_hz(notes[k].midi);
-        let mut onsets: Vec<Vec<Segment>> = (i..=j).map(|k| if melisma(&notes[k].syl) { Vec::new() } else { consonants_at(&notes[k].syl.onset, o.body, 0.8, hz_of(k)) }).collect();
+        let clen = o.consonant_length.unwrap_or(0.8);
+        let mut onsets: Vec<Vec<Segment>> = (i..=j).map(|k| if melisma(&notes[k].syl) { Vec::new() } else { consonants_at(&notes[k].syl.onset, o.body, clen, hz_of(k)) }).collect();
         let mut codas: Vec<Vec<Segment>> = (i..=j)
-            .map(|k| if k < j && melisma(&notes[k + 1].syl) { Vec::new() } else { consonants_at(&last_of_chain(notes, k).coda, o.body, 0.8, hz_of(k)) })
+            .map(|k| if k < j && melisma(&notes[k + 1].syl) { Vec::new() } else { consonants_at(&last_of_chain(notes, k).coda, o.body, clen, hz_of(k)) })
             .collect();
         // the phrase's last vowel leaves a short breath before the next phrase. The call's last
         // phrase is followed by a rest (callers split phrases at rests), so the breath comes from
@@ -197,7 +254,11 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
                 // is the move heard in the note's first sound? (its vowel, or a consonant that
                 // sounds its pitch); and the old note's length
                 let heard = onset.first().is_none_or(|c| phoneme(&c.ipa, o.body).is_some_and(|d| d.voicing == Voicing::Voiced && !matches!(d.manner, Manner::Stop | Manner::Affricate)));
-                led.push((segs.len(), heard, times[k] - times[k - 1]));
+                // into a consonant, the lead is for leaps: a step may slide in the consonant,
+                // as a singer's does (a tone down into an r takes all of the r), where a leap
+                // sliding there is a swoop; a third or more is led in full
+                let far = if onset.is_empty() { 1.0 } else { js_min(1.0, (notes[k].midi - notes[k - 1].midi).abs() / 4.0) };
+                led.push((segs.len(), heard, far, times[k] - times[k - 1]));
             }
             segs.extend(onset);
             let parts = diphthong_parts(&n.syl.nucleus.ipa);
@@ -247,6 +308,19 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             // blend by weight. So:
             let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
             let of = |g: &Gesture, label: &str, s: &PlannedSegment| g.label.as_ref().is_some_and(|l| l.as_str() == label) && same(g.t0, s.t0) && same(g.t1, s.t1);
+            // shaded vowels: the vowel's gesture aims between its own articulation and the
+            // other vowel's (first, while every gesture is still on its segment's span)
+            if let Some(shades) = &o.vowels {
+                for s in plan.segments.iter().filter(|s| s.kind == "vowel") {
+                    let Some((to, w)) = shades.get(&s.ipa) else { continue };
+                    let (Some(own), Some(other)) = (vowel_artic(&s.ipa, o.body), vowel_artic(to, o.body)) else { continue };
+                    let w = js_min(1.0, js_max(0.0, *w));
+                    let targets = artic_targets(&ArticPatch::blend(&[(1.0 - w, own), (w, other)]));
+                    for g in plan.gestures.iter_mut().filter(|g| of(g, &s.ipa, s)) {
+                        g.targets = targets;
+                    }
+                }
+            }
             // a hum keeps its closure (the gestures labelled with it that end with its span)
             // while the breath stops at the end of a phrase, and into a consonant after it, so
             // the mouth does not open on the voice between the two
@@ -275,10 +349,10 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             // nothing, and took a short slurred note's pitch away early.
             if let Some(lead) = o.pitch_lead {
                 let pitch = |g: &Gesture| g.label.as_ref().is_some_and(|l| l.as_str() == "pitch");
-                for &(at, heard, old_note) in &led {
+                for &(at, heard, far, old_note) in &led {
                     let edge = plan.segments[at].t0;
                     // at most three tenths of the old note
-                    let cut = edge - if heard { js_min(lead, 0.3 * old_note) } else { 0.0 };
+                    let cut = edge - if heard { js_min(lead * far, 0.3 * old_note) } else { 0.0 };
                     // the old note's pitch ends at the cut: what lies wholly after it (a short
                     // coda) goes, and the new note's pitch covers it
                     plan.gestures.retain(|g| !(pitch(g) && g.t0 >= cut - 1e-9 && g.t1 <= edge + 1e-9 && g.t0 < edge - 1e-9 && cut < edge - 1e-9));
@@ -314,8 +388,10 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             gestures.extend_from_slice(&plan.gestures);
             segments.extend(plan.segments);
             for (a, b) in vowel_spans {
-                if b - a > 0.3 {
-                    gestures.push(vibrato_gesture(a, b, o.vibrato, None));
+                match o.vibrato_grows {
+                    Some(grow) => growing_vibrato(a, b, o.vibrato, grow, &mut gestures),
+                    None if b - a > 0.3 => gestures.push(vibrato_gesture(a, b, o.vibrato, None)),
+                    None => {}
                 }
             }
             end = js_max(end, plan.end);

@@ -594,7 +594,7 @@ fn plan_line(j: &serde_json::Value, g: &EnglishG2P, body_name: &str, t0: f64, be
 }
 
 /// Sing a melody: `{"bpm", "lyrics", "notes": [[midi, beats], ...], "t0"?, "vibrato"?, "source"?,
-/// "speech"?, "speechSource"?, "diphthongs"?, "melismaLead"?, "pronounce"?}` (`pronounce`: see
+/// "speech"?, "speechSource"?, "diphthongs"?, "pitchLead"?, "pitchFollow"?, "pronounce"?}` (`pronounce`: see
 /// [`g2p_saying`]; the caller loads it). One lyric syllable per sounding note; a note with midi <= 0 is a rest, which
 /// splits the melody into phrases planned separately on one voice. `source` sets the vocal folds
 /// for the singing (a `SourcePatch`: tension, breathiness, brightness, pressure, roughness...),
@@ -604,9 +604,11 @@ fn plan_line(j: &serde_json::Value, g: &EnglishG2P, body_name: &str, t0: f64, be
 /// voice: the vocal folds go back to the engine's default for a line, with `speechSource` over
 /// it (`{"pressure": 13}` projects the line over other singers: at the default 8 cmH2O speech is
 /// some 9 dB under the singing), and to the sung source after it.
-/// `diphthongs` (`{"glide": 0.5, "open": "ɑ"}`) and `melismaLead` (seconds) are the song
+/// `diphthongs` (`{"glide": 0.5, "open": "ɑ"}`) and `pitchLead` (seconds) are the song
 /// planner's options of those names (`SongOptions`): diphthongs that glide over the last part of
-/// their note, from a darker vowel, and slurred notes whose pitch is there on the beat.
+/// their note, from a darker vowel, and notes whose pitch is there as they start. `pitchFollow`
+/// (seconds) is how closely the voice follows the written pitch (`HumanVoice::pitch_follow`, 0.03
+/// unless set). Together, less of a swoop between notes: a lead of 0.05 and a follow of 0.012.
 fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tele: bool) -> Result<Sung, String> {
     let b = body(body_name)?;
     let bpm = j["bpm"].as_f64().ok_or("bpm missing")?;
@@ -620,7 +622,7 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         Some(d) if !d.is_null() => Some(serde_json::from_value(d.clone()).map_err(|e| format!("diphthongs: {e}"))?),
         _ => None,
     };
-    let melisma_lead = j["melismaLead"].as_f64();
+    let pitch_lead = j["pitchLead"].as_f64();
     let syl = lyrics_to_syllables(j["lyrics"].as_str().ok_or("lyrics missing")?, g);
     let sounding = raw.iter().filter(|n| n[0] > 0.0).count();
     if syl.len() != sounding {
@@ -639,6 +641,9 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         ..Default::default()
     });
     v.set_source(&SourcePatch { f0: None, voiced: None, ..source });
+    if let Some(follow) = j["pitchFollow"].as_f64() {
+        v.pitch_follow = follow;
+    }
     // the spoken lines, and where the vocal folds change for them (lines close together share
     // one stretch of the speaking voice)
     let mut lines: Vec<Line> = match j.get("speech") {
@@ -684,7 +689,7 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         if phrase.is_empty() {
             return;
         }
-        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, diphthongs: diphthongs.clone(), melisma_lead });
+        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, diphthongs: diphthongs.clone(), pitch_lead });
         v.schedule(&plan.gestures);
         *end = js_max(*end, plan.end);
         phrase.clear();
@@ -809,7 +814,7 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         let body_name = v["body"].as_str().unwrap_or("male");
         body(body_name)?;
         let mut melody = serde_json::json!({"bpm": bpm, "t0": t0, "lyrics": v["lyrics"], "notes": v["notes"]});
-        for k in ["vibrato", "source", "speech", "speechSource", "diphthongs", "melismaLead"] {
+        for k in ["vibrato", "source", "speech", "speechSource", "diphthongs", "pitchLead", "pitchFollow"] {
             if let Some(x) = v.get(k) {
                 melody[k] = x.clone();
             }

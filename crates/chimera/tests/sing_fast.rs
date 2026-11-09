@@ -130,7 +130,7 @@ fn a_hummed_syllable_holds_its_nasal_for_the_note() {
 
 /// The options that change how a song is sung leave it alone when unset, and when set: a
 /// diphthong sets out from a darker vowel and moves to its second in one smooth glide over the
-/// last part of the note; a melisma's pitch is on its way before the beat.
+/// last part of the note; a note's pitch is moved to quickly, before the note's first sound.
 #[test]
 fn diphthongs_glide_and_melismas_lead_only_when_asked() {
     use chimera::phonetics::sing::Diphthongs;
@@ -143,7 +143,7 @@ fn diphthongs_glide_and_melismas_lead_only_when_asked() {
     let notes = vec![SungNote { midi: 66.0, beats: 0.5, syl: wa }, SungNote { midi: 65.0, beats: 0.5, syl: on }, SungNote { midi: 66.0, beats: 2.0, syl: life }];
     let base = SongOptions { body: "male".into(), bpm: 60.0, t0: 1.0, vibrato: 0.0, ..Default::default() };
     let plain = plan_song(&notes, &base);
-    let styled = plan_song(&notes, &SongOptions { diphthongs: Some(Diphthongs { glide: 0.5, open: Some("ɑ".into()) }), melisma_lead: Some(0.06), ..base.clone() });
+    let styled = plan_song(&notes, &SongOptions { diphthongs: Some(Diphthongs { glide: 0.5, open: Some("ɑ".into()) }), pitch_lead: Some(0.06), ..base.clone() });
     let ipa = |p: &Plan| p.segments.iter().map(|s| s.ipa.as_str()).collect::<String>();
     assert_eq!((ipa(&plain).as_str(), ipa(&styled).as_str()), ("wɑɑlaɪf", "wɑɑlɑɪf"));
     let vowel = |p: &Plan, v: &str, after: f64| p.gestures.iter().find(|g| g.label.as_ref().is_some_and(|l| l.as_str() == v) && g.t0 >= after).cloned().unwrap();
@@ -164,4 +164,18 @@ fn diphthongs_glide_and_melismas_lead_only_when_asked() {
     let change = |p: &Plan| pitches(p).iter().map(|x| x.0).filter(|t| *t > 1.2).fold(f64::MAX, f64::min);
     assert!((change(&plain) - 1.5).abs() < 1e-9 && (change(&styled) - 1.44).abs() < 1e-9, "plain {} styled {}", change(&plain), change(&styled));
     assert!(pitches(&styled).iter().any(|x| (x.1 - 1.44).abs() < 1e-9), "the old note's pitch should end at 1.44: {:?}", pitches(&styled));
+    // an onset consonant is not led (the pitch moves in it): the l of "life", back up to F#4,
+    // takes its pitch as it starts, as before; but both sides of each move are quick
+    let l = |p: &Plan| p.segments.iter().find(|s| s.ipa == "l").cloned().unwrap();
+    let early = 0.0;
+    let starts = |p: &Plan, t: f64| p.gestures.iter().any(|g| g.label.as_ref().is_some_and(|x| x.as_str() == "pitch") && (g.t0 - t).abs() < 1e-9);
+    assert!(starts(&plain, l(&plain).t0) && starts(&styled, l(&styled).t0));
+    for g in styled.gestures.iter().filter(|g| g.label.as_ref().is_some_and(|x| x.as_str() == "pitch")) {
+        if (g.t0 - 1.44).abs() < 1e-9 || (g.t0 - (l(&styled).t0 - early)).abs() < 1e-9 {
+            assert!(g.ramp_in <= 0.03 + 1e-9, "comes in over {}", g.ramp_in);
+        }
+        if (g.t1 - 1.44).abs() < 1e-9 || (g.t1 - (l(&styled).t0 - early)).abs() < 1e-9 {
+            assert!(g.ramp_out <= 0.03 + 1e-9, "lets go over {}", g.ramp_out);
+        }
+    }
 }

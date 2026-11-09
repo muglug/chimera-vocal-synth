@@ -190,6 +190,10 @@ pub struct HumanVoice {
     base_abduction: f64,
     base_closure: f64,
     score_f0: Option<f64>,
+    /// how closely the pitch follows a scored one: the time constant (s) of its approach. 30 ms
+    /// takes 80 ms to come within a quarter-tone of a note a fifth away, which is heard as a
+    /// swoop into the note; a trained singer's move is over sooner (a show sets 12 ms).
+    pub pitch_follow: f64,
     lim_env: f64,
     lim_hold: i64,
     lim_hold_n: i64,
@@ -245,6 +249,7 @@ impl HumanVoice {
             base_abduction: 0.0,
             base_closure: 0.0,
             score_f0: None,
+            pitch_follow: 0.03,
             lim_env: 0.0,
             lim_hold: 0,
             lim_hold_n: crate::math::js_round(0.025 * fs_out) as i64,
@@ -496,7 +501,7 @@ impl HumanVoice {
         // gives wider, sharper-closing pulses, as in real phonation, not just more flow
         self.glottis.params.effort = clamp(((self.source.pressure * self.gate).abs() - 3.0) / 10.0, 0.0, 1.0);
         // pitch glide
-        let g = js_max(0.002, if self.score_f0.is_some() { 0.03 } else { self.source.glide });
+        let g = js_max(0.002, if self.score_f0.is_some() { self.pitch_follow } else { self.source.glide });
         self.f0 *= pow(f0_target / self.f0, 1.0 - exp(-dt / g));
         self.glottis.params.f0 = self.f0;
         // smoothed mean flow per tract node (for particle speeds)

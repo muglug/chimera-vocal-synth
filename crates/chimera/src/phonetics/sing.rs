@@ -95,12 +95,14 @@ pub struct SongOptions {
     /// note's last fifth, with the planner's quick step between them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diphthongs: Option<Diphthongs>,
-    /// a melisma's pitch starts for its note this long before the beat (s), so that it has
-    /// arrived on the beat, as a note's pitch has after an onset consonant. None: the move
-    /// straddles the beat (and lags it by the voice's 30 ms glide), which a short note inside a
-    /// word does not outlast: a quaver's neighbour note at a fast tempo is not heard.
+    /// a note's pitch is moved to in at most [`PITCH_MOVE`] seconds each way: during its onset
+    /// consonants, or with none (a melisma) starting this long (s) before the beat, so the vowel
+    /// starts on its pitch. None: the old note's pitch lets go only as the new note begins, over
+    /// up to 60 ms, and the voice follows that late. A voiced onset then swoops into its note
+    /// ("r-recipes" up a fifth is 120 cents flat on the beat), and a short slurred note inside a
+    /// word (a quaver's neighbour note at a fast tempo) is over before its pitch is heard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub melisma_lead: Option<f64>,
+    pub pitch_lead: Option<f64>,
 }
 
 /// A sung diphthong that glides: "life" as laaa-iife rather than lah-if.
@@ -118,6 +120,9 @@ pub struct Diphthongs {
 
 /// a diphthong's glide takes at most this long (s), however long the note
 pub const MAX_GLIDE: f64 = 0.8;
+/// with [`SongOptions::pitch_lead`], the old note's pitch lets go and the new one's comes in
+/// over at most this long each (s), at the same time
+pub const PITCH_MOVE: f64 = 0.03;
 
 /// A hum (a syllable whose core is a nasal: "dm", "mm") after consonants opens for this long (s)
 /// on the beat before the lips close, at most 0.3 of the note: the consonant's release needs an
@@ -153,9 +158,9 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
         let mut segs: Vec<Segment> = Vec::new();
         let mut vowel_spans: Vec<(f64, f64)> = Vec::new();
         // segments to reshape once planned: a gliding diphthong's first vowel and how long the
-        // move to its second takes, and the vowels of melismas whose pitch leads the beat
+        // move to its second takes, and the first segment of each note whose pitch leads it
         let mut glides: Vec<(usize, f64)> = Vec::new();
-        let mut led: Vec<usize> = Vec::new();
+        let mut led: Vec<(usize, f64)> = Vec::new();
         // and the hums, which hold their closure a little past their span
         let mut hums: Vec<usize> = Vec::new();
         // each note's onset and coda consonants, at the note's pitch (a coda at the pitch of the
@@ -187,10 +192,11 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             let vdur = js_max(0.02, note_end - times[k] - total(&coda));
             let hum = !is_vowel(&n.syl.nucleus.ipa, o.body);
             let released = hum && !onset.is_empty();
-            segs.extend(onset);
-            if melisma(&n.syl) && k > i && o.melisma_lead.is_some() {
-                led.push(segs.len());
+            if k > i && o.pitch_lead.is_some() && notes[k].midi != notes[k - 1].midi {
+                // with how long its onset consonants give the pitch to move in
+                led.push((segs.len(), total(&onset)));
             }
+            segs.extend(onset);
             let parts = diphthong_parts(&n.syl.nucleus.ipa);
             // the vowel a diphthong sets out from
             let first = |a: &str| match &o.diphthongs {
@@ -238,6 +244,45 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             // blend by weight. So:
             let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
             let of = |g: &Gesture, label: &str, s: &PlannedSegment| g.label.as_ref().is_some_and(|l| l.as_str() == label) && same(g.t0, s.t0) && same(g.t1, s.t1);
+            // a hum keeps its closure (the gestures labelled with it that end with its span)
+            // while the breath stops at the end of a phrase, and into a consonant after it, so
+            // the mouth does not open on the voice between the two
+            for &at in &hums {
+                let seg = plan.segments[at].clone();
+                let hold = match plan.segments.get(at + 1) {
+                    None => HUM_HOLD,
+                    Some(next) if next.kind != "vowel" => js_min(0.04, 0.6 * (next.t1 - next.t0)),
+                    Some(_) => 0.0,
+                };
+                for g in plan.gestures.iter_mut() {
+                    if g.label.as_ref().is_some_and(|l| l.as_str() == seg.ipa) && g.t0 >= seg.t0 - 0.05 && (g.t1 - seg.t1).abs() < 0.05 {
+                        g.t1 += hold;
+                    }
+                }
+            }
+            // a note's pitch: the old note's last segment lets go of its pitch and the new
+            // note's first takes its own over a short ramp each, so the move is quick, and early
+            // enough to be over on the beat. Onset consonants are that time already (the pitch
+            // moves in them, unheard in a voiceless one), so only a note without any (a
+            // melisma, a word that starts on its vowel) is led. Leading a consonant too bends
+            // the old note's last 50 ms instead: it took a short note's pitch away early.
+            if let Some(lead) = o.pitch_lead {
+                for &(at, onset) in &led {
+                    let (prev, this) = (plan.segments[at - 1].clone(), plan.segments[at].clone());
+                    let lead = if onset > 0.0 { 0.0 } else { js_min(lead, 0.5 * (prev.t1 - prev.t0)) };
+                    // (by the end they share: an earlier move may have shifted the other one)
+                    let pitch = |g: &Gesture| g.label.as_ref().is_some_and(|l| l.as_str() == "pitch");
+                    for g in plan.gestures.iter_mut().filter(|g| pitch(g)) {
+                        if same(g.t1, prev.t1) && g.t0 < prev.t1 {
+                            g.t1 -= lead;
+                            g.ramp_out = js_min(g.ramp_out, PITCH_MOVE);
+                        } else if same(g.t0, this.t0) && g.t1 > this.t0 {
+                            g.t0 -= lead;
+                            g.ramp_in = js_min(g.ramp_in, PITCH_MOVE);
+                        }
+                    }
+                }
+            }
             // a gliding diphthong: the first vowel lets go early, by the length of the move, and
             // ramps out over it while the second ramps in over the same stretch. Their weights
             // add to one throughout, so the blend is one smooth move from the first vowel to the
@@ -255,37 +300,6 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
                 // the timeline shows the vowels changing over at the middle of the move
                 plan.segments[at].t1 -= 0.5 * mv;
                 plan.segments[at + 1].t0 -= 0.5 * mv;
-            }
-            // a hum keeps its closure (the gestures labelled with it that end with its span)
-            // while the breath stops at the end of a phrase, and into a consonant after it, so
-            // the mouth does not open on the voice between the two
-            for &at in &hums {
-                let seg = plan.segments[at].clone();
-                let hold = match plan.segments.get(at + 1) {
-                    None => HUM_HOLD,
-                    Some(next) if next.kind != "vowel" => js_min(0.04, 0.6 * (next.t1 - next.t0)),
-                    Some(_) => 0.0,
-                };
-                for g in plan.gestures.iter_mut() {
-                    if g.label.as_ref().is_some_and(|l| l.as_str() == seg.ipa) && g.t0 >= seg.t0 - 0.05 && (g.t1 - seg.t1).abs() < 0.05 {
-                        g.t1 += hold;
-                    }
-                }
-            }
-            // a melisma's pitch: the old note's ends and the new one's starts early by the lead
-            // (by at most 0.4 of the old note's vowel), so the move is over by the beat
-            if let Some(lead) = o.melisma_lead {
-                for &at in &led {
-                    let (prev, this) = (plan.segments[at - 1].clone(), plan.segments[at].clone());
-                    let lead = js_min(lead, 0.4 * (prev.t1 - prev.t0));
-                    for g in plan.gestures.iter_mut() {
-                        if of(g, "pitch", &prev) {
-                            g.t1 -= lead;
-                        } else if of(g, "pitch", &this) {
-                            g.t0 -= lead;
-                        }
-                    }
-                }
             }
             gestures.extend_from_slice(&plan.gestures);
             segments.extend(plan.segments);

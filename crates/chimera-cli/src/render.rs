@@ -779,8 +779,10 @@ fn sounding_db(x: &[f32]) -> f64 {
 ///
 /// Each voice is a melody as `render notes` sings it (see [`sing`]), all on the show's `bpm` and
 /// `t0`, so they share sample 0. Written: per voice `<name>.json` (its melody, for the words at
-/// its mouth) and `<name>.tele`; `mix.wav` (stereo: each voice at its `gain`, panned −1 left … 1
-/// right, the sum scaled to a −1 dB peak); and `show.json`. The voices render side by side.
+/// its mouth), `<name>.tele` and `<name>.wav` (the voice alone, mono, as loud as it is in the
+/// mix: the page plays these so a voice can be muted); `mix.wav` (stereo: each voice at its
+/// `gain`, panned −1 left … 1 right, the sum scaled to a −1 dB peak); and `show.json`. The voices
+/// render side by side.
 /// A voice's `"levels": [[beat, level], …]` moves it in the mix as the piece goes (straight lines
 /// between the breakpoints, on top of `gain`): the voice with the tune up, the ones humming under
 /// it down.
@@ -860,13 +862,12 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         println!("{}  {} notes  {} s  {} dB while sounding (peak {})", pad_end(&v.name, 12), pad_start(&r.sounding.to_string(), 5), fixed(r.out.len() as f64 / FS, 1), fixed(sounding_db(&r.out), 1), fixed(peak(&r.out), 3));
         parts.push(r);
     }
-    // the mix: constant-power panning, then one scale for the whole track
+    // each voice at its gain and its level over time, as long as the longest: its own track
     let n = parts.iter().map(|p| p.out.len()).max().unwrap_or(0);
-    let mut mix = vec![0f64; 2 * n];
+    let mut tracks: Vec<Vec<f64>> = Vec::with_capacity(parts.len());
     for (v, p) in voices.iter().zip(&parts) {
-        let a = (v.pan + 1.0) * PI / 4.0;
-        let (l, r) = (v.gain * cos(a), v.gain * sin(a));
-        // the voice's level over time: straight lines between its breakpoints, held outside them
+        let mut track = vec![0f64; n];
+        // the level: straight lines between its breakpoints, held outside them
         let mut at = 0usize;
         for (i, &x) in p.out.iter().enumerate() {
             let t = i as f64 / FS;
@@ -878,8 +879,18 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
                 (Some((_, g)), None) | (None, Some(&(_, g))) => g,
                 (None, None) => 1.0,
             };
-            mix[2 * i] += l * level * x as f64;
-            mix[2 * i + 1] += r * level * x as f64;
+            track[i] = v.gain * level * x as f64;
+        }
+        tracks.push(track);
+    }
+    // the mix: constant-power panning, then one scale for the whole track
+    let mut mix = vec![0f64; 2 * n];
+    for (v, track) in voices.iter().zip(&tracks) {
+        let a = (v.pan + 1.0) * PI / 4.0;
+        let (l, r) = (cos(a), sin(a));
+        for (i, &x) in track.iter().enumerate() {
+            mix[2 * i] += l * x;
+            mix[2 * i + 1] += r * x;
         }
     }
     let top = mix.iter().fold(0.0f64, |p, &v| js_max(p, v.abs()));
@@ -887,12 +898,18 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     let mix: Vec<f32> = mix.iter().map(|&v| (v * k) as f32).collect();
     let audio = format!("{out_dir}/mix.wav");
     ctx.write_wav_stereo(&audio, &mix)?;
+    // and the voices one by one, mono, at their place in that mix (the same scale; the page pans
+    // them as the mix did): played together they are the mix, and any of them can be left out
+    for (v, track) in voices.iter().zip(&tracks) {
+        let scaled: Vec<f32> = track.iter().map(|&x| (x * k) as f32).collect();
+        ctx.write_wav(&format!("{out_dir}/{}.wav", v.id), &scaled)?;
+    }
     let mut show = serde_json::json!({
         "title": title,
         "audio": "mix.wav",
         "bpm": bpm,
         "downbeat": j["downbeat"].as_f64().unwrap_or(t0),
-        "voices": voices.iter().map(|v| serde_json::json!({"name": v.name, "tele": format!("{}.tele", v.id), "melody": format!("{}.json", v.id)})).collect::<Vec<_>>(),
+        "voices": voices.iter().map(|v| serde_json::json!({"name": v.name, "tele": format!("{}.tele", v.id), "melody": format!("{}.json", v.id), "audio": format!("{}.wav", v.id), "pan": v.pan})).collect::<Vec<_>>(),
     });
     // what only the page reads goes through as it is
     for k in ["spell", "bowTie"] {

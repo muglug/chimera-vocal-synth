@@ -15,7 +15,7 @@ for tests and the `chimera` CLI.
 - **Beatbox**: pads and a step sequencer, every drum an articulatory gesture.
 - **Bestiary**: songbird (two-voice syrinx), seal, alligator and elephant.
 - **Duet** (`?show=<id>`): 3D heads replay a pre-rendered song, one per voice (two, or a
-  sextet in two rows).
+  sextet in two rows). Mute a voice to sing it yourself against the others.
 
 Male, female and child bodies blend continuously. Everything on screen animates from live
 engine state: pressure in the airway, airflow, the vocal folds, spectra and formants.

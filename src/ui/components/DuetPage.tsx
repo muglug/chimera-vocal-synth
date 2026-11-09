@@ -9,6 +9,11 @@
  * `chimera render notes … --tele`. The voices' renders and the mix must share sample 0.
  * `chimera render show score.json public/shows/<id>` makes the whole folder from one file.
  *
+ * When every voice also has `audio` (its own mono track, as loud as it is in the mix: `render
+ * show` writes them) and `pan`, the page plays those instead of the mix and each head has a Mute
+ * button: silence a voice and sing it yourself against the others. A muted head goes on moving,
+ * with its words, to sing along to.
+ *
  *   { "title": "…", "audio": "mix.mp3", "bpm": 103, "downbeat": 0,
  *     "voices": [{ "name": "Lower", "tele": "male.tele" }, { "name": "Upper", "tele": "female.tele" }] }
  *
@@ -19,7 +24,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { AnatomyView3D, type HeadFeed } from "./AnatomyView3D.tsx";
-import { Screen } from "./Screen.tsx";
+import { Chip, Screen } from "./Screen.tsx";
 import { TeleTrack } from "../../show/tele.ts";
 import { Transport } from "../../show/transport.ts";
 import { getModel } from "../useModel.ts";
@@ -40,7 +45,7 @@ interface ShowFile {
   downbeat?: number;
   spell?: Record<string, string>;
   bowTie?: boolean;
-  voices: { name: string; tele: string; melody?: string }[];
+  voices: { name: string; tele: string; melody?: string; audio?: string; pan?: number }[];
 }
 
 interface Loaded {
@@ -98,7 +103,10 @@ export function DuetPage(props: { id: string }) {
     (async () => {
       const show = (await (await fetchOk(base + "show.json")).json()) as ShowFile;
       if (!show.voices?.length || !show.audio) throw new Error("show.json needs audio and voices");
-      const [audio, ...teles] = await Promise.all([fetchOk(base + show.audio).then((r) => r.arrayBuffer()), ...show.voices.map((v) => fetchOk(base + v.tele).then((r) => r.arrayBuffer()))]);
+      // the voices' own tracks when the show has them all (they can then be muted), else the mix
+      const parts = show.voices.every((v) => v.audio);
+      const bytes = (file: string) => fetchOk(base + file).then((r) => r.arrayBuffer());
+      const [audio, teles] = await Promise.all([Promise.all(parts ? show.voices.map((v) => bytes(v.audio!)) : [bytes(show.audio)]), Promise.all(show.voices.map((v) => bytes(v.tele)))]);
       // the words: syllables as the CLI splits them (the pronouncing dictionary first, as it does)
       const melodies = await Promise.all(show.voices.map((v) => (v.melody ? fetchOk(base + v.melody).then((r) => r.json() as Promise<Melody>) : null)));
       if (melodies.some(Boolean)) await g2p.load().catch(() => {});
@@ -112,7 +120,8 @@ export function DuetPage(props: { id: string }) {
         }
       });
       const voices = show.voices.map((v, i) => ({ name: v.name, track: new TeleTrack(teles[i]), words: words[i] }));
-      await transport.load(audio);
+      if (parts) await transport.loadParts(audio, show.voices.map((v) => v.pan ?? 0));
+      else await transport.load(audio[0]);
       if (live) setLoaded({ show, voices });
     })().catch((e: unknown) => live && setError(e instanceof Error ? e.message : String(e)));
     return () => {
@@ -150,7 +159,7 @@ export function DuetPage(props: { id: string }) {
         <span className="duet-title">{title}</span>
       </header>
       <main className="duet-heads" style={{ "--cols": cols } as React.CSSProperties}>
-        {loaded && transport ? loaded.voices.map((v, i) => <Head key={`${i} ${facing(i)}`} name={v.name} track={v.track} words={v.words} show={loaded.show} transport={transport} facing={facing(i)} />) : <p className="duet-msg">Loading the song…</p>}
+        {loaded && transport ? loaded.voices.map((v, i) => <Head key={`${i} ${facing(i)}`} name={v.name} track={v.track} words={v.words} show={loaded.show} transport={transport} facing={facing(i)} part={i} />) : <p className="duet-msg">Loading the song…</p>}
       </main>
       <footer className="duet-bar">
         <button className="primary large" disabled={!loaded} onClick={() => (st.playing ? transport?.pause() : transport?.play())}>
@@ -176,8 +185,15 @@ export function DuetPage(props: { id: string }) {
 }
 
 /** one voice's head (made anew when it turns the other way: its view is built facing one side) */
-function Head(props: { name: string; track: TeleTrack; words: SungWords | null; show: ShowFile; transport: Transport; facing: 1 | -1 }) {
+function Head(props: { name: string; track: TeleTrack; words: SungWords | null; show: ShowFile; transport: Transport; facing: 1 | -1; part: number }) {
   const { track, show, transport, words } = props;
+  // (the page redraws when the transport says a part was muted)
+  const muted = transport.isMuted(props.part);
+  const mute = transport.canMute ? (
+    <Chip on={muted} aria-label={`Mute ${props.name}`} onClick={() => transport.setMuted(props.part, !muted)}>
+      Mute
+    </Chip>
+  ) : undefined;
   const feedRef = useRef<HeadFeed | null>(null);
   // the syllable at the mouth, written on the side the face looks to
   const overlayRef = useRef<OverlayFn | undefined>(undefined);
@@ -206,7 +222,7 @@ function Head(props: { name: string; track: TeleTrack; words: SungWords | null; 
     };
   }
   return (
-    <Screen className="duet-head" focus title={props.name} sub={bodyLabel(track.body)} label={`${props.name} voice, ${bodyLabel(track.body)}, in 3D`}>
+    <Screen className={`duet-head${muted ? " muted" : ""}`} focus title={props.name} sub={bodyLabel(track.body)} tools={mute} label={`${props.name} voice, ${bodyLabel(track.body)}, in 3D`}>
       <AnatomyView3D feed={feedRef.current} readouts={false} overlay={overlayRef.current} />
     </Screen>
   );

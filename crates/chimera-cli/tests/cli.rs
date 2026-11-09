@@ -488,7 +488,8 @@ fn render_show_writes_each_voice_the_stereo_mix_and_the_show_file() {
     assert_eq!(
         show,
         serde_json::json!({"title": "Two apart", "audio": "mix.wav", "bpm": 120.0, "downbeat": 0.25, "spell": {"lah": "la"}, "bowTie": true,
-            "voices": [{"name": "Alto 1", "tele": "alto-1.tele", "melody": "alto-1.json"}, {"name": "Bass", "tele": "bass.tele", "melody": "bass.json"}]})
+            "voices": [{"name": "Alto 1", "tele": "alto-1.tele", "melody": "alto-1.json", "audio": "alto-1.wav", "pan": -1.0},
+                       {"name": "Bass", "tele": "bass.tele", "melody": "bass.json", "audio": "bass.wav", "pan": 1.0}]})
     );
     // a voice's melody is what `render notes` sings: the show's tempo and start, its own source
     let alto: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/alto-1.json")).unwrap()).unwrap();
@@ -506,6 +507,15 @@ fn render_show_writes_each_voice_the_stereo_mix_and_the_show_file() {
     // scaled to a -1 dB peak
     let peak = mix.iter().fold(0.0f64, |p, v| p.max(v.abs()));
     assert!((peak - 0.891 * 32767.0).abs() < 2.0, "peak {peak}");
+
+    // each voice alone is a mono track as long as the mix and as loud as it is in it: panned
+    // hard to a side, it is that side of the mix
+    for (name, side_k) in [("alto-1", 0), ("bass", 1)] {
+        let (channels, track) = read_wav(&format!("{dir}/{name}.wav"));
+        assert_eq!((channels, track.len()), (1, frames), "{name}");
+        let off = track.iter().zip(mix.iter().skip(side_k).step_by(2)).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+        assert!(off <= 1.0, "{name} differs from its side of the mix by {off}");
+    }
 
     // each voice's telemetry runs on the mix's clock (the longer voice ends the mix)
     let tele = |name: &str| {

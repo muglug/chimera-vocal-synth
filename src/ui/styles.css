@@ -2821,6 +2821,11 @@ input[type="range"]::-moz-range-thumb {
   min-height: 180px;
 }
 
+/* a muted voice: still there to sing along to (its head moves, its words show), but dimmed */
+.duet-head.muted canvas {
+  opacity: 0.5;
+}
+
 .duet-bar {
   display: flex;
   align-items: center;

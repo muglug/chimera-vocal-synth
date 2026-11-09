@@ -2,6 +2,10 @@
  * Plays one decoded track and keeps the one playhead every head reads: what the listener hears
  * now, in seconds into the track. Its own AudioContext (the voice engine doesn't run here).
  *
+ * The track is the show's mix, or its parts: one mono track per voice (`loadParts`), started
+ * together and each panned to its place, which sound as the mix does and can be muted one by one
+ * (to sing a part yourself against the others).
+ *
  * Paused, the playhead is the saved position. Playing, it is that position plus the audible time
  * since the source started (never less than none: the first moments after Play are still in the
  * output buffer): the context's output timestamp where the browser has one (it already allows for
@@ -14,8 +18,11 @@ export type TransportState = { playing: boolean; time: number; duration: number;
 
 export class Transport {
   readonly ctx: AudioContext;
-  private buffer: AudioBuffer | null = null;
-  private src: AudioBufferSourceNode | null = null;
+  /** what plays: the mix alone, or every part */
+  private buffers: AudioBuffer[] = [];
+  /** each part's way out (its gain, then its pan); none for a mix, which goes straight out */
+  private outs: { gain: GainNode; pan: StereoPannerNode; muted: boolean }[] = [];
+  private srcs: AudioBufferSourceNode[] = [];
   private offset = 0;
   private startedAt = 0;
   private playing = false;
@@ -37,12 +44,44 @@ export class Transport {
   }
 
   async load(data: ArrayBuffer): Promise<void> {
-    this.buffer = await this.ctx.decodeAudioData(data);
+    this.buffers = [await this.ctx.decodeAudioData(data)];
+    this.emit();
+  }
+
+  /** The show as its parts: one mono track per voice, each panned −1 (left) … 1 (right). */
+  async loadParts(data: ArrayBuffer[], pans: number[]): Promise<void> {
+    const buffers = await Promise.all(data.map((d) => this.ctx.decodeAudioData(d)));
+    this.outs = buffers.map((_, i) => {
+      const gain = this.ctx.createGain(), pan = this.ctx.createStereoPanner();
+      pan.pan.value = Math.min(1, Math.max(-1, pans[i] ?? 0));
+      gain.connect(pan);
+      pan.connect(this.ctx.destination);
+      return { gain, pan, muted: false };
+    });
+    this.buffers = buffers;
+    this.emit();
+  }
+
+  /** whether parts can be muted (the show was loaded as its parts) */
+  get canMute(): boolean {
+    return this.outs.length > 0;
+  }
+
+  isMuted(part: number): boolean {
+    return this.outs[part]?.muted ?? false;
+  }
+
+  /** Silence a part, or bring it back: at once, playing or not (over 10 ms, without a click). */
+  setMuted(part: number, muted: boolean): void {
+    const o = this.outs[part];
+    if (!o || o.muted === muted) return;
+    o.muted = muted;
+    o.gain.gain.setTargetAtTime(muted ? 0 : 1, this.ctx.currentTime, 0.01);
     this.emit();
   }
 
   get duration(): number {
-    return this.buffer?.duration ?? 0;
+    return this.buffers.reduce((d, b) => Math.max(d, b.duration), 0);
   }
 
   get isPlaying(): boolean {
@@ -64,7 +103,7 @@ export class Transport {
 
   /** Call from the tap itself: iOS only lets a user gesture start audio. */
   play(): void {
-    if (!this.buffer || this.playing) return;
+    if (!this.buffers.length || this.playing) return;
     const gen = ++this.generation;
     this.ctx.resume().catch(() => {
       // no audio (an interruption, a browser's refusal): back to paused, where it was
@@ -112,35 +151,45 @@ export class Transport {
   dispose(): void {
     this.generation++;
     this.stopSource();
+    for (const o of this.outs) {
+      o.gain.disconnect();
+      o.pan.disconnect();
+    }
     this.listeners.clear();
     void this.ctx.close().catch(() => {});
   }
 
+  /** One source per buffer, all started at the same context time and place in the track (the
+   *  parts are as long as each other: the first one's end is the track's). */
   private startSource(): void {
-    const src = this.ctx.createBufferSource();
-    src.buffer = this.buffer;
-    src.connect(this.ctx.destination);
-    src.onended = () => {
-      if (this.src === src) this.rendered = true;
-    };
-    this.src = src;
     this.rendered = false;
     this.startedAt = this.ctx.currentTime;
-    src.start(this.startedAt, this.offset);
+    this.srcs = this.buffers.map((buffer, i) => {
+      const src = this.ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(this.outs[i]?.gain ?? this.ctx.destination);
+      return src;
+    });
+    const first = this.srcs[0];
+    first.onended = () => {
+      if (this.srcs[0] === first) this.rendered = true;
+    };
+    for (const src of this.srcs) src.start(this.startedAt, this.offset);
   }
 
   private stopSource(): void {
-    const src = this.src;
-    this.src = null;
+    const srcs = this.srcs;
+    this.srcs = [];
     this.rendered = false;
-    if (!src) return;
-    src.onended = null;
-    try {
-      src.stop();
-    } catch {
-      // never started (the context was closed)
+    for (const src of srcs) {
+      src.onended = null;
+      try {
+        src.stop();
+      } catch {
+        // never started (the context was closed)
+      }
+      src.disconnect();
     }
-    src.disconnect();
   }
 
   /** the context time being heard now */

@@ -316,3 +316,25 @@ fn a_vowel_can_give_way_to_the_next_before_it_ends() {
     assert_eq!(i1.ramp_out, i0.ramp_out);
     assert_eq!(over.segments, plain.segments);
 }
+
+/// Out of an r the mouth can open slowly: the r's gestures take that long to let go and the
+/// vowel's own arrives that far into it; a stop is left alone.
+#[test]
+fn a_vowel_can_open_slowly_out_of_an_r() {
+    use chimera::phonetics::{Segment, Syllable};
+    let syl = |on: &str, v: &str| Syllable { text: on.into(), onset: vec![Segment::new(on)], nucleus: Segment::new(v), coda: vec![], melisma: None, word_end: true, phrase_end: false };
+    let notes = vec![SungNote { midi: 60.0, beats: 1.0, syl: syl("ɹ", "ɛ") }, SungNote { midi: 60.0, beats: 1.0, syl: syl("d", "i") }];
+    let base = SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, ..Default::default() };
+    let (plain, slow) = (plan_song(&notes, &base), plan_song(&notes, &SongOptions { glide_in: Some(0.09), ..base.clone() }));
+    let v = |p: &Plan, ipa: &str| p.gestures.iter().find(|g| g.label.as_ref().is_some_and(|l| l.as_str() == ipa)).cloned().unwrap();
+    let (e0, e1) = (v(&plain, "ɛ"), v(&slow, "ɛ"));
+    assert!((e1.t0 - (e0.t0 + 0.09)).abs() < 1e-9 && (e1.ramp_in - (e0.ramp_in + 0.09)).abs() < 1e-9, "the vowel arrives at {} over {}", e1.t0, e1.ramp_in);
+    let r = |p: &Plan| p.gestures.iter().filter(|g| g.label.as_ref().is_some_and(|l| l.as_str() == "ɹ")).map(|g| g.ramp_out).fold(0.0, f64::max);
+    assert!(r(&plain) < 0.09 && (r(&slow) - 0.117).abs() < 1e-9, "the r lets go over {} (was {})", r(&slow), r(&plain));
+    // and starts to early: as much of the 90 ms as the r (56 ms long here) has
+    let ends = |p: &Plan| p.gestures.iter().filter(|g| g.label.as_ref().is_some_and(|l| l.as_str() == "ɹ")).map(|g| g.t1).fold(f64::MIN, f64::max);
+    let early = ends(&plain) - ends(&slow);
+    assert!(early > 0.03 && early <= 0.09 + 1e-9, "the r lets go {early} early");
+    // after the d nothing changes
+    assert_eq!((v(&plain, "i").t0, v(&plain, "i").ramp_in), (v(&slow, "i").t0, v(&slow, "i").ramp_in));
+}

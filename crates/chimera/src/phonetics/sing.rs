@@ -151,6 +151,12 @@ pub struct SongOptions {
     /// shape to the last moment. None: a vowel holds its target for its whole span.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vowel_overlap: Option<f64>,
+    /// out of an r, l, w or y the mouth opens into the vowel over this long (s): the consonant
+    /// lets go that slowly and the vowel's shape arrives that far into the vowel (at most half
+    /// of it). None: the consonant is gone and the vowel there within 20 ms of the beat, which
+    /// on a sung r is heard as an attack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glide_in: Option<f64>,
 }
 
 /// How a held vowel's vibrato comes in: none for `delay` seconds, then growing over `over`
@@ -493,6 +499,31 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
                         } else if is(g, b) {
                             g.ramp_in += give + arrive;
                             g.t0 = js_min(g.t1, g.t0 + arrive);
+                        }
+                    }
+                }
+            }
+            // out of an approximant: the consonant's gestures fade slowly and the vowel's own
+            // arrives late
+            if let Some(over) = o.glide_in {
+                for k in 1..planned.len() {
+                    let (c, v) = (&planned[k - 1], &planned[k]);
+                    if v.kind != "vowel" || !(c.kind == "approximant" || c.kind == "lateral") {
+                        continue;
+                    }
+                    let late = js_min(over, 0.5 * (v.t1 - v.t0));
+                    for g in plan.gestures.iter_mut() {
+                        let label = g.label.as_ref().map_or("", |l| l.as_str());
+                        if label == v.ipa && g.t0 >= v.t0 - 1e-9 && g.t0 <= v.t0 + MAX_ARRIVE + 1e-9 && g.t1 <= v.t1 + 1e-9 {
+                            let to = js_min(g.t1, v.t0 + late);
+                            g.ramp_in += to - g.t0;
+                            g.t0 = to;
+                        } else if label == c.ipa && g.t0 >= c.t0 - 0.05 && (g.t1 - c.t1).abs() < 0.05 {
+                            // The consonant's gestures are several times as strong as the
+                            // vowel's, so the mouth only follows the vowel in the last quarter
+                            // of their fade: start it early, for the move to straddle the beat.
+                            g.t1 = js_max(g.t0 + 0.01, g.t1 - late);
+                            g.ramp_out = js_max(g.ramp_out, 1.3 * late);
                         }
                     }
                 }

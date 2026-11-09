@@ -164,12 +164,19 @@ fn diphthongs_glide_and_melismas_lead_only_when_asked() {
     let change = |p: &Plan| pitches(p).iter().map(|x| x.0).filter(|t| *t > 1.2).fold(f64::MAX, f64::min);
     assert!((change(&plain) - 1.5).abs() < 1e-9 && (change(&styled) - 1.44).abs() < 1e-9, "plain {} styled {}", change(&plain), change(&styled));
     assert!(pitches(&styled).iter().any(|x| (x.1 - 1.44).abs() < 1e-9), "the old note's pitch should end at 1.44: {:?}", pitches(&styled));
-    // an onset consonant is not led (the pitch moves in it): the l of "life", back up to F#4,
-    // takes its pitch as it starts, as before; but both sides of each move are quick
+    // a consonant that sounds its pitch is led too: the l of "life", back up to F#4, has its
+    // pitch 60 ms before it starts; and both sides of each move are quick
     let l = |p: &Plan| p.segments.iter().find(|s| s.ipa == "l").cloned().unwrap();
-    let early = 0.0;
+    let early = 0.06;
     let starts = |p: &Plan, t: f64| p.gestures.iter().any(|g| g.label.as_ref().is_some_and(|x| x.as_str() == "pitch") && (g.t0 - t).abs() < 1e-9);
-    assert!(starts(&plain, l(&plain).t0) && starts(&styled, l(&styled).t0));
+    assert!(starts(&plain, l(&plain).t0) && starts(&styled, l(&styled).t0 - early) && !starts(&styled, l(&styled).t0));
+    // a stop or a voiceless consonant hides the move and is not led: "tie" in place of "life"
+    let tie = Syllable { text: "tie".into(), onset: vec![seg("t")], nucleus: seg("aɪ"), coda: vec![], melisma: None, word_end: true, phrase_end: false };
+    let mut hidden = notes.clone();
+    hidden[2].syl = tie;
+    let p = plan_song(&hidden, &SongOptions { pitch_lead: Some(0.06), ..base.clone() });
+    let t = p.segments.iter().find(|s| s.ipa == "t").unwrap().t0;
+    assert!(starts(&p, t), "the t's pitch should start with it");
     for g in styled.gestures.iter().filter(|g| g.label.as_ref().is_some_and(|x| x.as_str() == "pitch")) {
         if (g.t0 - 1.44).abs() < 1e-9 || (g.t0 - (l(&styled).t0 - early)).abs() < 1e-9 {
             assert!(g.ramp_in <= 0.03 + 1e-9, "comes in over {}", g.ramp_in);

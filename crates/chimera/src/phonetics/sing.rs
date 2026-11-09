@@ -11,7 +11,7 @@
 //!
 //! These planners allocate (they run off the audio thread).
 
-use super::inventory::phoneme;
+use super::inventory::{Manner, Voicing, phoneme};
 use crate::anatomy::human::BodyMix;
 use super::planner::{PlanOptions, diphthong_parts, is_vowel, plan_utterance};
 use super::{Intonation, Plan, PlannedSegment, Segment, Syllable};
@@ -95,9 +95,10 @@ pub struct SongOptions {
     /// note's last fifth, with the planner's quick step between them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diphthongs: Option<Diphthongs>,
-    /// a note's pitch is moved to in at most [`PITCH_MOVE`] seconds each way: during its onset
-    /// consonants, or with none (a melisma) starting this long (s) before the beat, so the vowel
-    /// starts on its pitch. None: the old note's pitch lets go only as the new note begins, over
+    /// a note's pitch is moved to in at most [`PITCH_MOVE`] seconds each way, and where the move
+    /// would be heard in the note (it starts on its vowel, or on a consonant that sounds its
+    /// pitch: a nasal, r, l, w, j, a voiced fricative) this long (s) before its first sound, so
+    /// that sound starts on the pitch. None: the old note's pitch lets go only as the new note begins, over
     /// up to 60 ms, and the voice follows that late. A voiced onset then swoops into its note
     /// ("r-recipes" up a fifth is 120 cents flat on the beat), and a short slurred note inside a
     /// word (a quaver's neighbour note at a fast tempo) is over before its pitch is heard.
@@ -160,7 +161,7 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
         // segments to reshape once planned: a gliding diphthong's first vowel and how long the
         // move to its second takes, and the first segment of each note whose pitch leads it
         let mut glides: Vec<(usize, f64)> = Vec::new();
-        let mut led: Vec<(usize, f64)> = Vec::new();
+        let mut led: Vec<(usize, bool, f64)> = Vec::new();
         // and the hums, which hold their closure a little past their span
         let mut hums: Vec<usize> = Vec::new();
         // each note's onset and coda consonants, at the note's pitch (a coda at the pitch of the
@@ -193,8 +194,10 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             let hum = !is_vowel(&n.syl.nucleus.ipa, o.body);
             let released = hum && !onset.is_empty();
             if k > i && o.pitch_lead.is_some() && notes[k].midi != notes[k - 1].midi {
-                // with how long its onset consonants give the pitch to move in
-                led.push((segs.len(), total(&onset)));
+                // is the move heard in the note's first sound? (its vowel, or a consonant that
+                // sounds its pitch); and the old note's length
+                let heard = onset.first().is_none_or(|c| phoneme(&c.ipa, o.body).is_some_and(|d| d.voicing == Voicing::Voiced && !matches!(d.manner, Manner::Stop | Manner::Affricate)));
+                led.push((segs.len(), heard, times[k] - times[k - 1]));
             }
             segs.extend(onset);
             let parts = diphthong_parts(&n.syl.nucleus.ipa);
@@ -260,25 +263,32 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
                     }
                 }
             }
-            // a note's pitch: the old note's last segment lets go of its pitch and the new
-            // note's first takes its own over a short ramp each, so the move is quick, and early
-            // enough to be over on the beat. Onset consonants are that time already (the pitch
-            // moves in them, unheard in a voiceless one), so only a note without any (a
-            // melisma, a word that starts on its vowel) is led. Leading a consonant too bends
-            // the old note's last 50 ms instead: it took a short note's pitch away early.
+            // A note's pitch: the old note lets go of its pitch and the new note takes its own
+            // over a short ramp each, so the move is quick; and where the move would be heard in
+            // the new note, it is made early, in the last of the old one, to be over as the new
+            // note's first sound starts. That is a note with no onset consonant (a melisma, a
+            // word that starts on its vowel) and one whose first consonant carries its pitch
+            // out loud: a nasal, r, l, w, j, a voiced fricative. Left to move in such a
+            // consonant the pitch is halfway as it starts and slides through all of it ("r-re"
+            // up a fifth starts near the old note). A voiceless consonant or a stop hides the
+            // move, so those notes are not led: leading them bends the old note's vowel for
+            // nothing, and took a short slurred note's pitch away early.
             if let Some(lead) = o.pitch_lead {
-                for &(at, onset) in &led {
-                    let (prev, this) = (plan.segments[at - 1].clone(), plan.segments[at].clone());
-                    let lead = if onset > 0.0 { 0.0 } else { js_min(lead, 0.5 * (prev.t1 - prev.t0)) };
-                    // (by the end they share: an earlier move may have shifted the other one)
-                    let pitch = |g: &Gesture| g.label.as_ref().is_some_and(|l| l.as_str() == "pitch");
+                let pitch = |g: &Gesture| g.label.as_ref().is_some_and(|l| l.as_str() == "pitch");
+                for &(at, heard, old_note) in &led {
+                    let edge = plan.segments[at].t0;
+                    // at most three tenths of the old note
+                    let cut = edge - if heard { js_min(lead, 0.3 * old_note) } else { 0.0 };
+                    // the old note's pitch ends at the cut: what lies wholly after it (a short
+                    // coda) goes, and the new note's pitch covers it
+                    plan.gestures.retain(|g| !(pitch(g) && g.t0 >= cut - 1e-9 && g.t1 <= edge + 1e-9 && g.t0 < edge - 1e-9 && cut < edge - 1e-9));
                     for g in plan.gestures.iter_mut().filter(|g| pitch(g)) {
-                        if same(g.t1, prev.t1) && g.t0 < prev.t1 {
-                            g.t1 -= lead;
-                            g.ramp_out = js_min(g.ramp_out, PITCH_MOVE);
-                        } else if same(g.t0, this.t0) && g.t1 > this.t0 {
-                            g.t0 -= lead;
+                        if same(g.t0, edge) && g.t1 > edge {
+                            g.t0 = cut;
                             g.ramp_in = js_min(g.ramp_in, PITCH_MOVE);
+                        } else if g.t0 < cut && g.t1 <= edge + 1e-9 && g.t1 + g.ramp_out > cut {
+                            g.t1 = js_min(g.t1, cut);
+                            g.ramp_out = js_min(g.ramp_out, js_max(0.005, cut + PITCH_MOVE - g.t1));
                         }
                     }
                 }

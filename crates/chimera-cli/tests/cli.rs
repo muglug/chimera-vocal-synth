@@ -522,3 +522,50 @@ fn render_show_writes_each_voice_the_stereo_mix_and_the_show_file() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"alto-1\""), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+/// A melody's "speech" is said, not sung: each line starts where it is written and its words
+/// keep their own lengths (not the beat's), slowed a little to fill a long time and hurried to
+/// finish in a short one. `render show` writes the words' times for the page.
+#[test]
+fn render_show_speaks_a_melodys_lines_in_their_own_rhythm_and_in_time() {
+    let (input, dir) = (tmp("speech.json"), tmp("speech-out"));
+    // 120 bpm from 0.2 s: the first line has beats 1.5-5.5 (0.95-2.95 s), the second half a
+    // second from 3.2 s, the stops a quarter of a second from 3.95 s
+    std::fs::write(
+        &input,
+        r#"{"title": "Said", "bpm": 120, "t0": 0.2, "voices": [{"name": "Solo", "lyrics": "la la", "notes": [[60, 1], [0, 8], [60, 1]],
+            "speechSource": {"pressure": 13},
+            "speech": [{"at": 1.5, "beats": 4, "text": "Have I given you a clue?"},
+                       {"at": 6, "beats": 1, "text": "Have I given you a clue?"},
+                       {"at": 7.5, "beats": 0.5, "ipa": "tp", "show": "tp"}]}]}"#,
+    )
+    .unwrap();
+    chimera(&["render", "show", &input, &dir]);
+    let melody: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/solo.json")).unwrap()).unwrap();
+    let said: Vec<(f64, f64, String)> = melody["spoken"].as_array().unwrap().iter().map(|w| (w[0].as_f64().unwrap(), w[1].as_f64().unwrap(), w[2].as_str().unwrap().to_string())).collect();
+    let text = |r: std::ops::Range<usize>| said[r].iter().map(|w| w.2.as_str()).collect::<Vec<_>>();
+    assert_eq!(text(0..6), ["have", "i", "given", "you", "a", "clue"]);
+    assert_eq!(text(6..12), text(0..6));
+    assert_eq!(text(12..13), ["tp"]);
+
+    // the first line starts on its beat, runs word after word and is over within its time: at the
+    // planner's pace it would take 1.35 s of its two, and it is never slowed under 0.8 (1.69 s)
+    let line = &said[0..6];
+    assert!((line[0].0 - 0.95).abs() < 0.002, "starts at {}", line[0].0);
+    assert!(line.windows(2).all(|w| w[1].0 >= w[0].1 - 1e-9));
+    let len = line[5].1 - line[0].0;
+    assert!(len > 1.6 && len < 1.8, "said in {len} s");
+    // in the words' rhythm, not six equal beats: "a" is a fraction of "given" or "clue"
+    let dur = |i: usize| line[i].1 - line[i].0;
+    assert!(dur(4) < 0.4 * dur(2) && dur(4) < 0.4 * dur(5), "a {} given {} clue {}", dur(4), dur(2), dur(5));
+    // the same words with half a second to say them: hurried to end in time
+    let fast = &said[6..12];
+    assert!((fast[0].0 - 3.2).abs() < 0.002 && fast[5].1 <= 3.7 + 0.002, "said {}-{}", fast[0].0, fast[5].1);
+    assert!((fast[5].1 - fast[0].0) < 0.6 * len);
+
+    // it sounds while it is said, and the rests around the lines are silent
+    let (_, mix) = read_wav(&format!("{dir}/mix.wav"));
+    let level = |from: f64, to: f64| rms(&mix[2 * (from * 48000.0) as usize..2 * (to * 48000.0) as usize]);
+    assert!(level(1.0, 1.9) > 1500.0, "the line: {}", level(1.0, 1.9));
+    assert!(level(2.75, 3.05) < 60.0, "after it: {}", level(2.75, 3.05));
+}

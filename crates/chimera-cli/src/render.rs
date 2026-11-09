@@ -15,7 +15,7 @@ use chimera::phonetics::beatbox::{BEAT_PRESETS, BEAT_SOUNDS, BeatStep, beat_read
 use chimera::phonetics::english::EnglishG2P;
 use chimera::phonetics::ipa::tokenize_ipa;
 use chimera::phonetics::planner::{
-    PhraseInput, PlanOptions, plan_phrases, plan_utterance, vowel_table,
+    PhraseInput, PlanOptions, expand, plan_phrases, plan_utterance, vowel_table,
 };
 use chimera::phonetics::sing::{
     LegatoFrom, NoteOnOptions, SongOptions, SungNote, midi_to_hz, plan_note_off, plan_note_on,
@@ -24,7 +24,7 @@ use chimera::phonetics::sing::{
 use chimera::phonetics::songs::DEMO_SONGS;
 use chimera::phonetics::syllables::lyrics_to_syllables;
 use chimera::phonetics::{Intonation, Plan, Syllable};
-use chimera::voice::human_voice::{HumanVoice, SCOPE_POINTS, SourcePatch, VoiceTelemetry};
+use chimera::voice::human_voice::{DEFAULT_SOURCE, HumanVoice, SCOPE_POINTS, SourcePatch, VoiceTelemetry};
 use std::io::Read;
 use std::time::Instant;
 
@@ -446,16 +446,24 @@ impl TeleRecorder {
 /// (`artic`: frame i is the state at i / ARTIC_RATE s, plus one at the end) and/or the telemetry
 /// every `TELE_HOP` samples (`tele`). The two cadences are independent; taking telemetry is the
 /// only thing that resets its RMS levels. The voice runs sample by sample, so the sound is the
-/// same either way.
-fn render_tracked(v: &mut HumanVoice, out: &mut [f32], artic: bool, tele: bool) -> Result<(Vec<Vec<f64>>, Option<TeleRecorder>), String> {
+/// same either way. `sources` change the vocal folds at given samples (in order): a melody's
+/// spoken lines.
+fn render_tracked(v: &mut HumanVoice, out: &mut [f32], artic: bool, tele: bool, sources: &[(usize, SourcePatch)]) -> Result<(Vec<Vec<f64>>, Option<TeleRecorder>), String> {
     let a_hop = FS as usize / ARTIC_RATE;
     let frame = |v: &HumanVoice| ArticKey::ALL.iter().map(|k| js_round(v.artic.x.get(*k) * 1e4) / 1e4).collect();
     let mut frames = if artic { vec![frame(v)] } else { Vec::new() };
     let mut rec = if tele { Some(TeleRecorder::new(v)) } else { None };
     let n = out.len();
     let (mut pos, mut next_a, mut next_t) = (0usize, a_hop, TELE_HOP);
+    let mut changes = sources.iter().peekable();
     while pos < n {
+        while let Some((_, patch)) = changes.next_if(|c| c.0 <= pos) {
+            v.set_source(patch);
+        }
         let mut end = n;
+        if let Some(c) = changes.peek() {
+            end = end.min(c.0);
+        }
         if artic {
             end = end.min(next_a);
         }
@@ -485,14 +493,94 @@ struct Sung {
     frames: Vec<Vec<f64>>,
     rec: Option<TeleRecorder>,
     sounding: usize,
+    /// the words of the spoken lines: start, end (s), word
+    spoken: Vec<(f64, f64, String)>,
 }
 
-/// Sing a melody: `{"bpm", "lyrics", "notes": [[midi, beats], ...], "t0"?, "vibrato"?, "source"?}`.
-/// One lyric syllable per sounding note; a note with midi <= 0 is a rest, which splits the
-/// melody into phrases planned separately on one voice. `source` sets the vocal folds for the
-/// whole melody (a `SourcePatch`: tension, breathiness, brightness, pressure, roughness...), over
-/// the sung default (pressure 9, tension 0.55): a lax, breathy, dark source on the male body is
-/// a falsetto (`{"tension": 0.2, "breathiness": 0.45, "brightness": 0.1}`).
+/// A spoken line never slows below this rate to fill its time (1 is the planner's own pace).
+const SLOWEST_SPEECH: f64 = 0.8;
+/// The planner starts an utterance's first sound this long after its t0 (its breath's lead).
+const SPEECH_LEAD: f64 = 0.06;
+
+/// One spoken line of a melody, planned: when it sounds and its gestures.
+struct Line {
+    start: f64,
+    end: f64,
+    gestures: Vec<Gesture>,
+    words: Vec<(f64, f64, String)>,
+}
+
+/// Plan a melody's spoken line: `{"at": beats from the melody's start, "beats": the time it has,
+/// "text": "English words." | "ipa": "tp", "f0"?: Hz, "show"?: the word shown for an "ipa" line}`.
+/// It starts where it is written and is said in the rhythm of its words, not the beat's: at the
+/// planner's own pace when that fills the time, a little slower (never under
+/// [`SLOWEST_SPEECH`]) when the time is longer, and as much faster as it takes to finish in time.
+fn plan_line(j: &serde_json::Value, g: &EnglishG2P, body_name: &str, t0: f64, beat: f64) -> Result<Line, String> {
+    let at = j["at"].as_f64().ok_or("speech: at missing")?;
+    let beats = j["beats"].as_f64().filter(|b| *b > 0.0).ok_or("speech: beats missing")?;
+    let f0 = j["f0"].as_f64().unwrap_or(text_f0(body_name));
+    let (start, window) = (t0 + at * beat, beats * beat);
+    let (inputs, said): (Vec<PhraseInput>, Vec<String>) = if let Some(ipa) = j["ipa"].as_str() {
+        let mut segments = tokenize_ipa(ipa);
+        if let Some(last) = segments.last_mut() {
+            last.word_end = Some(true);
+        }
+        (vec![PhraseInput { segments, intonation: None, pause: None }], vec![j["show"].as_str().unwrap_or(ipa).to_string()])
+    } else {
+        let phrases = g.to_phrases(j["text"].as_str().ok_or("speech: text or ipa missing")?);
+        (
+            phrases.iter().map(|p| PhraseInput { segments: p.segments.clone(), intonation: Some(p.intonation), pause: Some(p.pause) }).collect(),
+            phrases.iter().flat_map(|p| p.words.iter().cloned()).collect(),
+        )
+    };
+    if inputs.iter().all(|p| p.segments.is_empty()) {
+        return Err(format!("speech: nothing to say in {j}"));
+    }
+    let plan_at = |rate: f64| plan_phrases(&inputs, &PlanOptions { body: body_name.into(), t0: start - SPEECH_LEAD, rate: Some(rate), f0: Some(f0), ..Default::default() });
+    let mut plan = plan_at(1.0);
+    let natural = plan.end - start;
+    if natural > window {
+        // faster, until it fits (the pauses between phrases don't shrink with the rate)
+        let mut rate = 1.0;
+        for _ in 0..8 {
+            rate *= 1.01 * (plan.end - start) / window;
+            plan = plan_at(rate);
+            if plan.end - start <= window {
+                break;
+            }
+        }
+    } else {
+        plan = plan_at(js_max(SLOWEST_SPEECH, natural / window));
+    }
+    // each word's time: its sounds in the plan (a diphthong is planned as its two vowels)
+    let mut words = Vec::new();
+    let (mut k, mut w, mut from) = (0usize, 0usize, None);
+    for seg in inputs.iter().flat_map(|p| &p.segments) {
+        let n = expand(&seg.ipa).map_or(1, |parts| parts.len());
+        let (Some(first), Some(last)) = (plan.segments.get(k), plan.segments.get(k + n - 1)) else { break };
+        let t = *from.get_or_insert(first.t0);
+        k += n;
+        if seg.word_end == Some(true) {
+            if let Some(word) = said.get(w) {
+                words.push((t, last.t1, word.clone()));
+            }
+            w += 1;
+            from = None;
+        }
+    }
+    Ok(Line { start, end: plan.end, gestures: plan.gestures, words })
+}
+
+/// Sing a melody: `{"bpm", "lyrics", "notes": [[midi, beats], ...], "t0"?, "vibrato"?, "source"?,
+/// "speech"?, "speechSource"?}`. One lyric syllable per sounding note; a note with midi <= 0 is a rest, which
+/// splits the melody into phrases planned separately on one voice. `source` sets the vocal folds
+/// for the singing (a `SourcePatch`: tension, breathiness, brightness, pressure, roughness...),
+/// over the sung default (pressure 9, tension 0.55): a lax, breathy, dark source on the male body
+/// is a falsetto (`{"tension": 0.2, "breathiness": 0.45, "brightness": 0.1}`).
+/// `speech` is lines the voice says in rests of its notes (see [`plan_line`]), in its speaking
+/// voice: the vocal folds go back to the engine's default for a line, with `speechSource` over
+/// it (`{"pressure": 13}` projects the line over other singers: at the default 8 cmH2O speech is
+/// some 9 dB under the singing), and to the sung source after it.
 fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tele: bool) -> Result<Sung, String> {
     let b = body(body_name)?;
     let bpm = j["bpm"].as_f64().ok_or("bpm missing")?;
@@ -520,7 +608,36 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         ..Default::default()
     });
     v.set_source(&SourcePatch { f0: None, voiced: None, ..source });
-    let (mut t, mut k, mut end) = (t0, 0usize, 0.0f64);
+    // the spoken lines, and where the vocal folds change for them (lines close together share
+    // one stretch of the speaking voice)
+    let mut lines: Vec<Line> = match j.get("speech") {
+        Some(serde_json::Value::Array(a)) => a.iter().map(|l| plan_line(l, g, body_name, t0, beat)).collect::<Result<_, _>>()?,
+        Some(serde_json::Value::Null) | None => Vec::new(),
+        Some(_) => return Err("speech: not a list".into()),
+    };
+    lines.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let folds = |s: &chimera::voice::human_voice::VoiceSource| SourcePatch { f0: None, glide: None, voiced: None, vibrato_depth: None, ..SourcePatch::from_source(s) };
+    let (singing, mut speaking) = (folds(&v.source), folds(&DEFAULT_SOURCE));
+    if let Some(x) = j.get("speechSource").filter(|x| !x.is_null()) {
+        let patch: SourcePatch = serde_json::from_value(x.clone()).map_err(|e| format!("speechSource: {e}"))?;
+        speaking.merge(&SourcePatch { f0: None, glide: None, voiced: None, vibrato_depth: None, ..patch });
+    }
+    let mut sources: Vec<(usize, SourcePatch)> = Vec::new();
+    let mut spoken = Vec::new();
+    let mut until = f64::NEG_INFINITY;
+    for l in &lines {
+        v.schedule(&l.gestures);
+        spoken.extend(l.words.iter().cloned());
+        let at = |t: f64| js_round(FS * js_max(0.0, t)) as usize;
+        if l.start - 0.03 > until + 0.25 {
+            sources.push((at(l.start - 0.03), speaking));
+            sources.push((at(l.end + 0.05), singing));
+        } else if let Some(last) = sources.last_mut() {
+            last.0 = at(l.end + 0.05);
+        }
+        until = js_max(until, l.end + 0.05);
+    }
+    let (mut t, mut k, mut end) = (t0, 0usize, lines.iter().fold(0.0f64, |e, l| js_max(e, l.end)));
     let mut phrase: Vec<SungNote> = Vec::new();
     let mut start = t;
     let flush = |phrase: &mut Vec<SungNote>, start: f64, v: &mut HumanVoice, end: &mut f64| {
@@ -547,13 +664,13 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
     flush(&mut phrase, start, &mut v, &mut end);
     let n = js_round(FS * (end + 0.4)) as usize;
     let mut out = vec![0f32; n];
-    let (frames, rec) = if artic || tele {
-        render_tracked(&mut v, &mut out, artic, tele)?
+    let (frames, rec) = if artic || tele || !sources.is_empty() {
+        render_tracked(&mut v, &mut out, artic, tele, &sources)?
     } else {
         render_blocks(&mut v, &mut out);
         (Vec::new(), None)
     };
-    Ok(Sung { out, frames, rec, sounding })
+    Ok(Sung { out, frames, rec, sounding, spoken })
 }
 
 /// `render notes <in.json> <out> [body] [--artic tracks.json] [--tele voice.tele]`: sing a melody
@@ -580,9 +697,9 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     let body_name = arg(a, 2, "male");
     let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
     let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{input}: {e}"))?;
-    let Sung { out, frames, rec, sounding } = sing(&j, body_name, &g2p()?, artic_out.is_some(), tele_out.is_some())?;
+    let Sung { out, frames, rec, sounding, spoken } = sing(&j, body_name, &g2p()?, artic_out.is_some(), tele_out.is_some())?;
     ctx.write_wav(&out_name, &out)?;
-    println!("{out_name}: {} s, peak {}, {} notes", fixed(out.len() as f64 / FS, 2), fixed(peak(&out), 3), sounding);
+    println!("{out_name}: {} s, peak {}, {} notes{}", fixed(out.len() as f64 / FS, 2), fixed(peak(&out), 3), sounding, if spoken.is_empty() { String::new() } else { format!(", {} spoken words", spoken.len()) });
     if let Some(path) = &artic_out {
         let j = serde_json::json!({"rate": ARTIC_RATE, "body": body_name, "keys": ArticKey::NAMES, "frames": frames});
         std::fs::write(path, j.to_string()).map_err(|e| format!("{path}: {e}"))?;
@@ -612,7 +729,7 @@ fn sounding_db(x: &[f32]) -> f64 {
 ///
 ///   { "title": "…", "bpm": 120, "t0"?: 0.3, "downbeat"?: s, "spell"?: {"dum": "dm"}, "bowTie"?: true,
 ///     "voices": [{ "name": "Bass", "lyrics": "…", "notes": [[midi, beats], …],
-///                  "body"?: "male", "source"?: {…}, "vibrato"?: 35, "gain"?: 1, "pan"?: 0 }, …] }
+///                  "body"?: "male", "source"?: {…}, "speech"?: […], "vibrato"?: 35, "gain"?: 1, "pan"?: 0 }, …] }
 ///
 /// Each voice is a melody as `render notes` sings it (see [`sing`]), all on the show's `bpm` and
 /// `t0`, so they share sample 0. Written: per voice `<name>.json` (its melody, for the words at
@@ -646,7 +763,7 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         let body_name = v["body"].as_str().unwrap_or("male");
         body(body_name)?;
         let mut melody = serde_json::json!({"bpm": bpm, "t0": t0, "lyrics": v["lyrics"], "notes": v["notes"]});
-        for k in ["vibrato", "source"] {
+        for k in ["vibrato", "source", "speech", "speechSource"] {
             if let Some(x) = v.get(k) {
                 melody[k] = x.clone();
             }
@@ -669,7 +786,14 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         let (tele, melody) = (format!("{out_dir}/{}.tele", v.id), format!("{out_dir}/{}.json", v.id));
         let rec = r.rec.as_ref().ok_or("no telemetry")?;
         std::fs::write(&tele, rec.bytes(body_mix(&v.body)?)).map_err(|e| format!("{tele}: {e}"))?;
-        std::fs::write(&melody, v.melody.to_string()).map_err(|e| format!("{melody}: {e}"))?;
+        // with the times its spoken words took, which only the render knows: the page writes them
+        // at the mouth as it does the sung syllables
+        let mut written = v.melody.clone();
+        if !r.spoken.is_empty() {
+            let ms = |t: f64| js_round(t * 1000.0) / 1000.0;
+            written["spoken"] = r.spoken.iter().map(|(a, b, w)| serde_json::json!([ms(*a), ms(*b), w])).collect();
+        }
+        std::fs::write(&melody, written.to_string()).map_err(|e| format!("{melody}: {e}"))?;
         println!("{}  {} notes  {} s  {} dB while sounding (peak {})", pad_end(&v.name, 12), pad_start(&r.sounding.to_string(), 5), fixed(r.out.len() as f64 / FS, 1), fixed(sounding_db(&r.out), 1), fixed(peak(&r.out), 3));
         parts.push(r);
     }

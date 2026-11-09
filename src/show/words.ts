@@ -1,6 +1,7 @@
 /**
  * The words at a duet head's mouth: each sung note's syllable over the note's time, from the voice's
- * melody file (the one `chimera render notes` sang), as Sing mode's demo shows them.
+ * melody file (the one `chimera render notes` sang), as Sing mode's demo shows them; and the words
+ * of its spoken lines, at the times the render said them.
  */
 import type { Syllable } from "../wasm/types.ts";
 import type { MouthWord } from "../ui/mouthWords.ts";
@@ -11,14 +12,18 @@ export interface Melody {
   t0?: number;
   lyrics: string;
   notes: [number, number][];
+  /** the words of its spoken lines: start, end (s, on the render's clock), word. Speech keeps its
+   *  own rhythm, so only the render knows these: `chimera render show` writes them. */
+  spoken?: [number, number, string][];
 }
 
 export interface SungWords {
-  /** sounding notes' start and end (s, on the render's clock) */
+  /** sounding notes' (and spoken words') start and end (s, on the render's clock), in order */
   times: [number, number][];
-  /** what the mouth shows per note: its syllable, or a melisma's parent's */
+  /** what the mouth shows per note: its syllable, or a melisma's parent's; or the spoken word */
   shown: string[];
-  /** the note whose syllable each note sings (a melisma's parent) */
+  /** the word's key: the note whose syllable each note sings (a melisma's parent), counted among
+   *  the notes; a spoken word has a negative one of its own */
   parent: number[];
 }
 
@@ -43,7 +48,11 @@ export function sungWords(m: Melody, syls: Syllable[], spell: Record<string, str
     const s = syls[p];
     return (respell.get(s.text.toLowerCase()) ?? s.text) + (s.wordEnd ? "" : "-");
   });
-  return { times, shown, parent };
+  if (!m.spoken?.length) return { times, shown, parent };
+  // the spoken words among the notes, by time
+  const all = times.map((t, i) => ({ t, text: shown[i], key: parent[i] })).concat(m.spoken.map(([a, b, w], i) => ({ t: [a, b] as [number, number], text: w, key: -1 - i })));
+  all.sort((x, y) => x.t[0] - y.t[0]);
+  return { times: all.map((e) => e.t), shown: all.map((e) => e.text), parent: all.map((e) => e.key) };
 }
 
 /** the word sounding at time t (s), keyed by its note so a repeated word is still a new one */

@@ -607,9 +607,10 @@ fn plan_line(j: &serde_json::Value, g: &EnglishG2P, body_name: &str, t0: f64, be
 /// `diphthongs` (`{"glide": 0.5, "open": "ɑ"}`), `pitchLead` (seconds), `vowels`
 /// (`{"i": ["y", 0.9]}`: each vowel shaded towards another) and `vibratoGrows` (`{"delay": 0.1,
 /// "over": 0.8}`: vibrato that comes in through the note) are the song planner's options of
-/// those names (`SongOptions`), as are `consonantLength`, `codaLength`, `devoiceOver` and `consonantPosture`; `sibilance` (`{"gain": 2, "lowpass":
+/// those names (`SongOptions`), as are `consonantLength`, `consonantLengths`, `codaLength`, `devoiceOver`, `vowelOverlap` and `consonantPosture`; `sibilance` (`{"gain": 2, "lowpass":
 /// 11000, "highpass": 3000}`) is the strength and band of the noise made at the teeth;
-/// `articulatorSpeed` (`{"tbX": 0.7, "tbY": 0.7}`) slows or quickens named articulators; `posture` (`{"epilarynx": 1}`) is the singer's resting
+/// `articulatorSpeed` (`{"tbX": 0.7, "tbY": 0.7}`) slows or quickens named articulators;
+/// `outputLevel` (0.3) runs the voice under the engine's output limiter; `posture` (`{"epilarynx": 1}`) is the singer's resting
 /// articulation, for what no sung sound moves: diphthongs that glide over the last part of
 /// their note, from a darker vowel, and notes whose pitch is there as they start. `pitchFollow`
 /// (seconds) is how closely the voice follows the written pitch (`HumanVoice::pitch_follow`, 0.03
@@ -630,7 +631,12 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
     let pitch_lead = j["pitchLead"].as_f64();
     let consonant_length = j["consonantLength"].as_f64();
     let coda_length = j["codaLength"].as_f64();
+    let consonant_lengths: Option<std::collections::BTreeMap<String, f64>> = match j.get("consonantLengths") {
+        Some(d) if !d.is_null() => Some(serde_json::from_value(d.clone()).map_err(|e| format!("consonantLengths: {e}"))?),
+        _ => None,
+    };
     let devoice_over = j["devoiceOver"].as_f64();
+    let vowel_overlap = j["vowelOverlap"].as_f64();
     let consonant_posture: Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>> = match j.get("consonantPosture") {
         Some(d) if !d.is_null() => Some(serde_json::from_value(d.clone()).map_err(|e| format!("consonantPosture: {e}"))?),
         _ => None,
@@ -663,6 +669,13 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
     v.set_source(&SourcePatch { f0: None, voiced: None, ..source });
     if let Some(follow) = j["pitchFollow"].as_f64() {
         v.pitch_follow = follow;
+    }
+    // The voice's output level, against the engine's. At 1 a sung vowel sits on the output
+    // limiter (0.75), which turns every loud moment down to the same level: weak syllables, a w,
+    // the start of a note all come out nearly as loud as the vowels. Under about 0.35 nothing
+    // reaches it and the voice keeps its own dynamics (a show's mix sets the final level).
+    if let Some(level) = j["outputLevel"].as_f64() {
+        v.output_gain *= level;
     }
     // the hiss of s, z, sh made at the teeth: louder by `gain`, in a band of its own
     if let Some(s) = j.get("sibilance").filter(|s| !s.is_null()) {
@@ -735,7 +748,7 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         if phrase.is_empty() {
             return;
         }
-        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, diphthongs: diphthongs.clone(), pitch_lead, vowels: vowels.clone(), vibrato_grows, consonant_length, coda_length, devoice_over, consonant_posture: consonant_posture.clone() });
+        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, diphthongs: diphthongs.clone(), pitch_lead, vowels: vowels.clone(), vibrato_grows, consonant_length, coda_length, consonant_lengths: consonant_lengths.clone(), devoice_over, vowel_overlap, consonant_posture: consonant_posture.clone() });
         v.schedule(&plan.gestures);
         *end = js_max(*end, plan.end);
         phrase.clear();
@@ -862,7 +875,7 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         let body_name = v["body"].as_str().unwrap_or("male");
         body(body_name)?;
         let mut melody = serde_json::json!({"bpm": bpm, "t0": t0, "lyrics": v["lyrics"], "notes": v["notes"]});
-        for k in ["vibrato", "source", "speech", "speechSource", "diphthongs", "pitchLead", "pitchFollow", "vowels", "posture", "vibratoGrows", "consonantLength", "codaLength", "devoiceOver", "consonantPosture", "sibilance", "articulatorSpeed"] {
+        for k in ["vibrato", "source", "speech", "speechSource", "diphthongs", "pitchLead", "pitchFollow", "vowels", "posture", "vibratoGrows", "consonantLength", "codaLength", "consonantLengths", "devoiceOver", "vowelOverlap", "consonantPosture", "sibilance", "articulatorSpeed", "outputLevel"] {
             if let Some(x) = v.get(k) {
                 melody[k] = x.clone();
             }

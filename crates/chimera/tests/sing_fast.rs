@@ -255,6 +255,10 @@ fn consonant_length_scales_the_sung_consonants() {
     for (x, y) in vowel_onsets(&half.segments).iter().zip(vowel_onsets(&plain.segments)) {
         assert!((x - y).abs() < 1e-9, "{x} against {y}");
     }
+    // a consonant with a length of its own keeps it whatever the rest are: the r at 1, s and t at 0.4
+    let own = plan_song(&notes, &SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, consonant_length: Some(0.4), consonant_lengths: Some(std::collections::BTreeMap::from([("ɹ".to_string(), 1.0)])), ..Default::default() });
+    let ratios: Vec<f64> = cons(&own).iter().zip(&a).map(|(y, x)| y / x).collect();
+    assert_eq!(ratios.iter().map(|r| (r * 100.0).round() as i32).collect::<Vec<_>>(), [50, 50, 125, 50, 50, 50, 125, 50]);
     // coda_length shortens only the consonants that close a syllable: the t of "strut", not s, t, r
     let clipped = plan_song(&notes, &SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, coda_length: Some(0.5), ..Default::default() });
     let ratios: Vec<f64> = cons(&clipped).iter().zip(&a).map(|(y, x)| y / x).collect();
@@ -291,4 +295,24 @@ fn devoicing_can_straddle_the_start_of_a_fricative() {
     let g = folds(&over);
     // the ramp runs from 40 ms before the s to 40 ms into it
     assert!((g.t0 - (s.t0 + 0.04)).abs() < 1e-9 && (g.ramp_in - 0.08).abs() < 1e-9 && (g.strength - 2.0).abs() < 1e-9, "from {} over {} at {}", g.t0, g.ramp_in, g.strength);
+}
+
+/// Vowels that give way: the first vowel's gesture lets go a share of its length early and
+/// fades over that much longer, the next vowel's comes in that much sooner; unset, nothing moves.
+#[test]
+fn a_vowel_can_give_way_to_the_next_before_it_ends() {
+    let (notes, _, plain) = sing("bah dee", 1.0, 60.0);
+    let over = plan_song(&notes, &SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, vowel_overlap: Some(0.4), ..Default::default() });
+    let v = |p: &Plan, ipa: &str| p.gestures.iter().find(|g| g.label.as_ref().is_some_and(|l| l.as_str() == ipa)).cloned().unwrap();
+    let (a0, i0, a1, i1) = (v(&plain, "ɑ"), v(&plain, "i"), v(&over, "ɑ"), v(&over, "i"));
+    // (a long vowel: the most it gives is 0.12 s)
+    let give = 0.12_f64.min(0.4 * (a0.t1 - a0.t0));
+    assert!((give - 0.12).abs() < 1e-9, "the vowel is {} long", a0.t1 - a0.t0);
+    assert!((a1.t1 - (a0.t1 - give)).abs() < 1e-9 && (a1.ramp_out - (a0.ramp_out + give)).abs() < 1e-9, "the ah lets go at {} over {}", a1.t1, a1.ramp_out);
+    // and the ee is still arriving 0.04 s into its own span
+    let arrive = 0.04_f64.min(0.4 * 0.4 * (i0.t1 - i0.t0));
+    assert!((i1.ramp_in - (i0.ramp_in + give + arrive)).abs() < 1e-9 && (i1.t0 - (i0.t0 + arrive)).abs() < 1e-9 && i1.t1 == i0.t1, "the ee comes in over {} to {}", i1.ramp_in, i1.t0);
+    // the last vowel has nothing to give way to
+    assert_eq!(i1.ramp_out, i0.ramp_out);
+    assert_eq!(over.segments, plain.segments);
 }

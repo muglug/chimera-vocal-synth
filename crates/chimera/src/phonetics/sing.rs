@@ -128,6 +128,11 @@ pub struct SongOptions {
     /// s that opens a stressed syllable 185)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coda_length: Option<f64>,
+    /// consonants with a length of their own, in place of `consonant_length`: a nasal or a w
+    /// needs its time to close (an m of 40 ms between two vowels never shuts the lips: "of my"
+    /// lost its m), where a stop or a fricative can be clipped
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consonant_lengths: Option<BTreeMap<String, f64>>,
     /// articulators held for a consonant, over its own gestures: consonant → articulator → value.
     /// A sung consonant otherwise takes the lips of the vowels round it, and between rounded
     /// (or shaded) vowels an s then has a long front cavity and hisses at 3-4 kHz, like a sh:
@@ -140,6 +145,12 @@ pub struct SongOptions {
     /// of 20-30 ms before the hiss; a singer's falls over 50 ms and the hiss is rising by then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devoice_over: Option<f64>,
+    /// each vowel gives way to the next over this last share of its length (0..1, at most
+    /// [`MAX_GIVE`] seconds): its own gesture starts to let go there and the next vowel's starts
+    /// to come in, so the mouth is already on its way as the vowel ends instead of holding one
+    /// shape to the last moment. None: a vowel holds its target for its whole span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vowel_overlap: Option<f64>,
 }
 
 /// How a held vowel's vibrato comes in: none for `delay` seconds, then growing over `over`
@@ -194,6 +205,14 @@ pub struct Diphthongs {
 
 /// a diphthong's glide takes at most this long (s), however long the note
 pub const MAX_GLIDE: f64 = 0.8;
+/// with [`SongOptions::vowel_overlap`], a vowel gives way over at most this long (s)
+/// (about as far ahead as a mouth anticipates. At 0.6 s a held "doo" before "bah" set out for
+/// the ah a third of the way through and was heard as "doo-ah-bah".)
+pub const MAX_GIVE: f64 = 0.12;
+/// and the next vowel is still arriving this far into its own length, as a share of the share
+/// (at most [`MAX_ARRIVE`] seconds)
+pub const ARRIVE: f64 = 0.4;
+pub const MAX_ARRIVE: f64 = 0.04;
 /// with [`SongOptions::pitch_lead`], the old note's pitch lets go and the new one's comes in
 /// over at most this long each (s), at the same time
 pub const PITCH_MOVE: f64 = 0.03;
@@ -241,9 +260,20 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
         // note whose syllable it ends; a melisma has neither)
         let hz_of = |k: usize| midi_to_hz(notes[k].midi);
         let clen = o.consonant_length.unwrap_or(0.8);
-        let mut onsets: Vec<Vec<Segment>> = (i..=j).map(|k| if melisma(&notes[k].syl) { Vec::new() } else { consonants_at(&notes[k].syl.onset, o.body, clen, hz_of(k)) }).collect();
+        // consonants the song gives a length of their own (times the coda's share for a coda)
+        let own_lengths = |mut segs: Vec<Segment>, coda: f64| {
+            if let Some(own) = &o.consonant_lengths {
+                for c in segs.iter_mut() {
+                    if let Some(k) = own.get(&c.ipa) {
+                        c.dur = Some(cdur(&c.ipa, o.body, *k * coda));
+                    }
+                }
+            }
+            segs
+        };
+        let mut onsets: Vec<Vec<Segment>> = (i..=j).map(|k| if melisma(&notes[k].syl) { Vec::new() } else { own_lengths(consonants_at(&notes[k].syl.onset, o.body, clen, hz_of(k)), 1.0) }).collect();
         let mut codas: Vec<Vec<Segment>> = (i..=j)
-            .map(|k| if k < j && melisma(&notes[k + 1].syl) { Vec::new() } else { consonants_at(&last_of_chain(notes, k).coda, o.body, clen * o.coda_length.unwrap_or(1.0), hz_of(k)) })
+            .map(|k| if k < j && melisma(&notes[k + 1].syl) { Vec::new() } else { own_lengths(consonants_at(&last_of_chain(notes, k).coda, o.body, clen * o.coda_length.unwrap_or(1.0), hz_of(k)), o.coda_length.unwrap_or(1.0)) })
             .collect();
         // the phrase's last vowel leaves a short breath before the next phrase. The call's last
         // phrase is followed by a rest (callers split phrases at rests), so the breath comes from
@@ -325,6 +355,8 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             // blend by weight. So:
             let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
             let of = |g: &Gesture, label: &str, s: &PlannedSegment| g.label.as_ref().is_some_and(|l| l.as_str() == label) && same(g.t0, s.t0) && same(g.t1, s.t1);
+            // the segments as planned (later steps move some of their times)
+            let planned = plan.segments.clone();
             // a vowel into a voiceless fricative: the folds' parting starts with the consonant
             if let Some(over) = o.devoice_over {
                 for k in 1..plan.segments.len() {
@@ -437,6 +469,33 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
                 // the timeline shows the vowels changing over at the middle of the move
                 plan.segments[at].t1 -= 0.5 * mv;
                 plan.segments[at + 1].t0 -= 0.5 * mv;
+            }
+            // vowels that give way: over the last part of a vowel its gesture lets go and the
+            // next vowel's comes in (through whatever consonants lie between, which hold their
+            // own articulators more strongly). A gliding diphthong's first vowel already does.
+            if let Some(share) = o.vowel_overlap {
+                let vowels: Vec<usize> = (0..planned.len()).filter(|&k| planned[k].kind == "vowel").collect();
+                for w in vowels.windows(2) {
+                    let (a, b) = (&planned[w[0]], &planned[w[1]]);
+                    if glides.iter().any(|g| g.0 == w[0]) {
+                        continue;
+                    }
+                    let give = js_min(MAX_GIVE, js_min(1.0, js_max(0.0, share)) * (a.t1 - a.t0));
+                    // (by where they start, give or take an arrival already moved)
+                    let is = |g: &Gesture, s: &PlannedSegment| g.label.as_ref().is_some_and(|l| l.as_str() == s.ipa) && g.t0 >= s.t0 - 1e-9 && g.t0 <= s.t0 + MAX_ARRIVE + 1e-9 && g.t1 <= s.t1 + 1e-9;
+                    // (the next vowel's own gesture starts a little into its span: it is still
+                    // arriving as it begins to sound)
+                    let arrive = js_min(MAX_ARRIVE, ARRIVE * js_min(1.0, js_max(0.0, share)) * (b.t1 - b.t0));
+                    for g in plan.gestures.iter_mut() {
+                        if is(g, a) && g.t1 > a.t0 {
+                            g.t1 = js_max(g.t0, g.t1 - give);
+                            g.ramp_out += give;
+                        } else if is(g, b) {
+                            g.ramp_in += give + arrive;
+                            g.t0 = js_min(g.t1, g.t0 + arrive);
+                        }
+                    }
+                }
             }
             gestures.extend_from_slice(&plan.gestures);
             segments.extend(plan.segments);

@@ -67,3 +67,16 @@ fn words_that_are_also_object_property_names_do_not_break_the_front_end() {
     assert!(!EnglishG2P::new().is_loaded());
     assert!(EnglishG2P::new().to_phrases("constructor")[0].segments.len() > 3); // no dictionary
 }
+
+/// A dictionary entry written between slashes is IPA: for sounds its own notation cannot spell.
+#[test]
+fn a_dictionary_entry_between_slashes_is_ipa() {
+    let mut g = EnglishG2P::new();
+    g.load_dict("fonder\t/ˈfɒndə/\nfond\tF AA1 N D\n");
+    let segs = g.word("fonder", false);
+    assert_eq!(ipa(&segs), "fɒndə");
+    assert_eq!((segs[1].stress, segs[4].stress), (Some(1), Some(0)), "the stress mark is on the first vowel");
+    assert_eq!(chimera::phonetics::syllables::syllabify_segments(&segs).len(), 2);
+    // the dictionary's own notation is read as before
+    assert_eq!(ipa(&g.word("fond", false)), "fɑnd");
+}

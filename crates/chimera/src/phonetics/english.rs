@@ -182,7 +182,12 @@ impl EnglishG2P {
         let clean = lower.trim_matches('\'');
         let entry = homograph(clean).or_else(|| self.dict.as_ref().and_then(|d| d.get(clean)).map(String::as_str));
         if let Some(entry) = entry.filter(|e| !e.is_empty()) {
-            let mut segs = arpabet_to_segments(entry);
+            // an entry written "/…/" is IPA, for sounds the dictionary's notation has no
+            // letters for (British "fonder", /ˈfɒndə/); the dictionary itself has none
+            let mut segs = match entry.strip_prefix('/') {
+                Some(ipa) => super::ipa::tokenize_ipa(ipa.trim_end_matches('/')),
+                None => arpabet_to_segments(entry),
+            };
             if reduce && is_function_word(clean) {
                 let nv = segs.iter().filter(|s| is_vowel(&s.ipa)).count();
                 for s in segs.iter_mut() {

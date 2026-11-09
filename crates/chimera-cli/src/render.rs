@@ -610,7 +610,7 @@ fn sounding_db(x: &[f32]) -> f64 {
 /// `render show <show.json> <outdir>`: a whole show for the app's duet page from one file, any
 /// number of voices. With `<outdir>` = `public/shows/<id>` it plays at `?show=<id>`.
 ///
-///   { "title": "…", "bpm": 120, "t0"?: 0.3, "downbeat"?: s, "spell"?: {"dum": "dm"},
+///   { "title": "…", "bpm": 120, "t0"?: 0.3, "downbeat"?: s, "spell"?: {"dum": "dm"}, "bowTie"?: true,
 ///     "voices": [{ "name": "Bass", "lyrics": "…", "notes": [[midi, beats], …],
 ///                  "body"?: "male", "source"?: {…}, "vibrato"?: 35, "gain"?: 1, "pan"?: 0 }, …] }
 ///
@@ -696,8 +696,11 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         "downbeat": j["downbeat"].as_f64().unwrap_or(t0),
         "voices": voices.iter().map(|v| serde_json::json!({"name": v.name, "tele": format!("{}.tele", v.id), "melody": format!("{}.json", v.id)})).collect::<Vec<_>>(),
     });
-    if let Some(spell) = j.get("spell") {
-        show["spell"] = spell.clone();
+    // what only the page reads goes through as it is
+    for k in ["spell", "bowTie"] {
+        if let Some(x) = j.get(k) {
+            show[k] = x.clone();
+        }
     }
     let path = format!("{out_dir}/show.json");
     std::fs::write(&path, show.to_string()).map_err(|e| format!("{path}: {e}"))?;

@@ -13,8 +13,9 @@
  *     "voices": [{ "name": "Lower", "tele": "male.tele" }, { "name": "Upper", "tele": "female.tele" }] }
  *
  * Optional: `bpm` and `downbeat` (s, a bar's first beat) nod the heads on the beat; a voice's
- * `melody` (the melody file it was rendered from) writes its words at its mouth, and the show's
- * `spell` ({"owr": "our"}) writes a syllable spelled for the dictionary as it should read.
+ * `melody` (the melody file it was rendered from) writes its words at its mouth, the show's
+ * `spell` ({"owr": "our"}) writes a syllable spelled for the dictionary as it should read, and
+ * `bowTie` (true) dresses every singer in one.
  */
 import { useEffect, useRef, useState } from "react";
 import { AnatomyView3D, type HeadFeed } from "./AnatomyView3D.tsx";
@@ -38,6 +39,7 @@ interface ShowFile {
   bpm?: number;
   downbeat?: number;
   spell?: Record<string, string>;
+  bowTie?: boolean;
   voices: { name: string; tele: string; melody?: string }[];
 }
 
@@ -192,6 +194,7 @@ function Head(props: { name: string; track: TeleTrack; words: SungWords | null; 
       view: VIEW,
       maxDpr: 1.5,
       facing: props.facing,
+      bowTie: show.bowTie === true,
       frame: () => {
         const t = transport.time();
         const i = track.indexAt(t);

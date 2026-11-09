@@ -475,7 +475,7 @@ fn render_show_writes_each_voice_the_stereo_mix_and_the_show_file() {
     // the upper voice rests two beats (1 s) while the lower sings, then they swap
     std::fs::write(
         &input,
-        r#"{"title": "Two apart", "bpm": 120, "t0": 0.25, "spell": {"lah": "la"},
+        r#"{"title": "Two apart", "bpm": 120, "t0": 0.25, "spell": {"lah": "la"}, "bowTie": true,
             "voices": [
               {"name": "Alto 1", "pan": -1, "vibrato": 10, "source": {"tension": 0.15, "breathiness": 0.5}, "lyrics": "la la", "notes": [[0, 2], [64, 1], [66, 1]]},
               {"name": "Bass", "pan": 1, "lyrics": "la la", "notes": [[45, 1], [47, 1], [0, 2]]}]}"#,
@@ -487,7 +487,7 @@ fn render_show_writes_each_voice_the_stereo_mix_and_the_show_file() {
     let show: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/show.json")).unwrap()).unwrap();
     assert_eq!(
         show,
-        serde_json::json!({"title": "Two apart", "audio": "mix.wav", "bpm": 120.0, "downbeat": 0.25, "spell": {"lah": "la"},
+        serde_json::json!({"title": "Two apart", "audio": "mix.wav", "bpm": 120.0, "downbeat": 0.25, "spell": {"lah": "la"}, "bowTie": true,
             "voices": [{"name": "Alto 1", "tele": "alto-1.tele", "melody": "alto-1.json"}, {"name": "Bass", "tele": "bass.tele", "melody": "bass.json"}]})
     );
     // a voice's melody is what `render notes` sings: the show's tempo and start, its own source

@@ -75,6 +75,63 @@ const LIP_HALF = 3.0;
 /** superellipse exponent of the back half of a cross-section */
 const PB = 2.2;
 
+/** A bow tie, as seen from the front (template cm): the knot, and a wing each side that widens to
+ *  its end. Red, with a white-black-white stripe across each wing and along the knot. */
+const TIE = {
+  /** its centre above the bottom of the neck, and in front of the skin there */
+  up: 2.0,
+  out: 0.45,
+  /** how much the wings bend back round the neck (cm per cm² to the side) */
+  bend: 0.03,
+  knot: { half: 0.85, h: 0.85, proud: 0.3 },
+  wing: { z0: 0.6, z1: 4.7, h0: 0.6, h1: 2.15 },
+  /** the stripe: where it starts along the wing, and its white, black and white bands */
+  stripe: { at: 2.2, bands: [0.3, 0.42, 0.3] },
+  red: [0.86, 0.2, 0.15],
+  white: [0.95, 0.95, 0.92],
+  black: [0.05, 0.05, 0.05],
+} as const;
+
+/** The bow tie's triangles (body cm, facing forward) and their colours, centred on the midline at
+ *  (x, y) and scaled by k. */
+function bowTie(x: number, y: number, k: number): { pos: Float32Array; col: Float32Array } {
+  const pos: number[] = [], col: number[] = [];
+  const T = TIE;
+  const at = (z: number, proud = 0) => x + k * proud - (T.bend / k) * z * z;
+  // a strip between two sides: (z, half-height) at each, or (y range) for the knot's bands
+  const quad = (z0: number, lo0: number, hi0: number, z1: number, lo1: number, hi1: number, c: readonly number[], proud = 0) => {
+    const A = [at(z0, proud), y + lo0, z0], B = [at(z1, proud), y + lo1, z1], C = [at(z1, proud), y + hi1, z1], D = [at(z0, proud), y + hi0, z0];
+    // wound to face forward (+x)
+    for (const v of [A, C, B, A, D, C]) {
+      pos.push(v[0], v[1], v[2]);
+      col.push(c[0], c[1], c[2]);
+    }
+  };
+  const w = T.wing;
+  const half = (z: number) => k * (w.h0 + ((w.h1 - w.h0) * (z / k - w.z0)) / (w.z1 - w.z0));
+  for (const side of [1, -1]) {
+    // along the wing: red, the stripe's bands, red
+    const cuts: [number, readonly number[]][] = [[w.z0, T.red]];
+    let z = T.stripe.at;
+    T.stripe.bands.forEach((b, i) => {
+      cuts.push([z, i === 1 ? T.black : T.white]);
+      z += b;
+    });
+    cuts.push([z, T.red], [w.z1, T.red]);
+    for (let i = 0; i < cuts.length - 1; i++) {
+      const a = k * cuts[i][0], b = k * cuts[i + 1][0];
+      // the far side first when mirrored, so the strip still faces forward
+      const [z0, z1] = side > 0 ? [a, b] : [-b, -a];
+      quad(z0, -half(Math.abs(z0)), half(Math.abs(z0)), z1, -half(Math.abs(z1)), half(Math.abs(z1)), cuts[i][1]);
+    }
+  }
+  // the knot, over the wings' roots: the stripe runs along it
+  const n = T.knot, [bw, bb] = [0.2, 0.28];
+  const rows: [number, readonly number[]][] = [[-n.h, T.red], [-bb / 2 - bw, T.white], [-bb / 2, T.black], [bb / 2, T.white], [bb / 2 + bw, T.red], [n.h, T.red]];
+  for (let i = 0; i < rows.length - 1; i++) quad(-k * n.half, k * rows[i][0], k * rows[i + 1][0], k * n.half, k * rows[i][0], k * rows[i + 1][0], rows[i][1], n.proud);
+  return { pos: new Float32Array(pos), col: new Float32Array(col) };
+}
+
 /** a head (or brain) cross-section at one height: front and back on the midline, the bare front
  *  beside the midline feature, half-width, where it is widest, the feature's size and width, and
  *  the superellipse exponent of the front half (the back half uses PB) */
@@ -644,6 +701,9 @@ export class Anatomy3D {
   /** which way the turned home view shows the face: 1 to the right, −1 to the left (a duet's
    *  second head, so the two sing towards each other) */
   facing: 1 | -1 = 1;
+  /** dressed for a concert: a bow tie at the front of the neck (a show's singers) */
+  bowTie = false;
+  private tie: { mesh: THREE.Mesh; rest: Rest } | null = null;
   private clock = 0;
   private readonly gaze = new Gaze();
   /** brows, lids, cheeks and the head's nods, from the voice (the view updates it) */
@@ -674,6 +734,40 @@ export class Anatomy3D {
 
   dispose(): void {
     this.beams.dispose();
+    this.dropTie();
+  }
+
+  private dropTie(): void {
+    if (!this.tie) return;
+    this.beams.group.remove(this.tie.mesh);
+    this.tie.mesh.geometry.dispose();
+    (this.tie.mesh.material as THREE.Material).dispose();
+    this.tie = null;
+  }
+
+  /**
+   * The bow tie: the one solid thing on the head, so its black stripe hides the lines behind it.
+   * It sits in the head's frame (the beams' group), at the front of the neck near its foot, and
+   * so nods and sways with the neck. Drawn after the lines (which neither test nor write depth,
+   * so the tie covers them all and only its own parts hide each other: the near wing the far
+   * one) and only from its front: from behind, the neck would hide it.
+   */
+  private dress(rest: Rest, k: number): void {
+    if (!this.bowTie) return this.dropTie();
+    if (this.tie?.rest === rest) return;
+    this.dropTie();
+    const y = rest.head.y0 + TIE.up * k;
+    const s = rest.head.at(y);
+    if (!s) return;
+    const { pos, col } = bowTie(frontX(s, 0, true) + TIE.out * k, y, k);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, toneMapped: false }));
+    mesh.renderOrder = 1;
+    mesh.frustumCulled = false;
+    this.beams.group.add(mesh);
+    this.tie = { mesh, rest };
   }
 
   /** forget the motion so far (a replay jumped): the face's springs and held-note time, the
@@ -762,6 +856,7 @@ export class Anatomy3D {
     const k = model.tract.scale;
     const face = this.face;
     this.headPose(rest, k);
+    this.dress(rest, k);
     const phi = jawAngle(model, a.jaw);
     const C = rest.condyle;
     const B = this.beams;

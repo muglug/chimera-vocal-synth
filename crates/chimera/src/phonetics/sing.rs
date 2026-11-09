@@ -123,6 +123,11 @@ pub struct SongOptions {
     /// to the minute is 119): a singer's are nearer 0.5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consonant_length: Option<f64>,
+    /// a syllable's closing consonants against its opening ones (1 when unset): a singer clips
+    /// the end of a word shorter than he starts the next (a recorded word-final s is 65 ms, an
+    /// s that opens a stressed syllable 185)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coda_length: Option<f64>,
     /// articulators held for a consonant, over its own gestures: consonant → articulator → value.
     /// A sung consonant otherwise takes the lips of the vowels round it, and between rounded
     /// (or shaded) vowels an s then has a long front cavity and hisses at 3-4 kHz, like a sh:
@@ -232,7 +237,7 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
         let clen = o.consonant_length.unwrap_or(0.8);
         let mut onsets: Vec<Vec<Segment>> = (i..=j).map(|k| if melisma(&notes[k].syl) { Vec::new() } else { consonants_at(&notes[k].syl.onset, o.body, clen, hz_of(k)) }).collect();
         let mut codas: Vec<Vec<Segment>> = (i..=j)
-            .map(|k| if k < j && melisma(&notes[k + 1].syl) { Vec::new() } else { consonants_at(&last_of_chain(notes, k).coda, o.body, clen, hz_of(k)) })
+            .map(|k| if k < j && melisma(&notes[k + 1].syl) { Vec::new() } else { consonants_at(&last_of_chain(notes, k).coda, o.body, clen * o.coda_length.unwrap_or(1.0), hz_of(k)) })
             .collect();
         // the phrase's last vowel leaves a short breath before the next phrase. The call's last
         // phrase is followed by a rest (callers split phrases at rests), so the breath comes from

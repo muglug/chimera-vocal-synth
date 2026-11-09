@@ -255,6 +255,10 @@ fn consonant_length_scales_the_sung_consonants() {
     for (x, y) in vowel_onsets(&half.segments).iter().zip(vowel_onsets(&plain.segments)) {
         assert!((x - y).abs() < 1e-9, "{x} against {y}");
     }
+    // coda_length shortens only the consonants that close a syllable: the t of "strut", not s, t, r
+    let clipped = plan_song(&notes, &SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, coda_length: Some(0.5), ..Default::default() });
+    let ratios: Vec<f64> = cons(&clipped).iter().zip(&a).map(|(y, x)| y / x).collect();
+    assert_eq!(ratios.iter().map(|r| (r * 100.0).round() as i32).collect::<Vec<_>>(), [100, 100, 100, 50, 100, 100, 100, 50]);
 }
 
 /// A consonant's posture: a gesture over each such consonant holding the named articulators,

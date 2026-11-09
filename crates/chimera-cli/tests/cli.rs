@@ -619,3 +619,21 @@ fn render_notes_pronounce_overrides_the_dictionary() {
     let (ok, err, _) = render("say-bad", r#", "pronounce": {"worries": 3}"#);
     assert!(!ok && err.starts_with("pronounce: "), "{err}");
 }
+
+/// A melody's "sibilance" makes the noise at the teeth louder and moves its band: the same
+/// "see so" has more of its energy changing fast (its hiss is stronger and higher).
+#[test]
+fn render_notes_sibilance_brightens_the_hiss() {
+    let fast = |name: &str, extra: &str| {
+        let (input, out) = (tmp(&format!("{name}.json")), tmp(name));
+        std::fs::write(&input, format!(r#"{{"bpm": 120, "t0": 0.2, "vibrato": 0, "lyrics": "see so see so", "notes": [[57, 1], [57, 1], [57, 1], [57, 1]]{extra}}}"#)).unwrap();
+        chimera(&["render", "notes", &input, &out]);
+        let (_, x) = read_wav(&format!("{out}.wav"));
+        // the second difference weighs a component by the square of its frequency
+        let d: Vec<f64> = x.windows(3).map(|w| w[2] - 2.0 * w[1] + w[0]).collect();
+        rms(&d) / rms(&x)
+    };
+    let plain = fast("sib-plain", "");
+    let bright = fast("sib-bright", r#", "sibilance": {"gain": 1.6, "lowpass": 8000, "highpass": 3500}"#);
+    assert!(bright > 1.3 * plain, "with sibilance {bright}, without {plain}");
+}

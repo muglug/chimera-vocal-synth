@@ -256,3 +256,20 @@ fn consonant_length_scales_the_sung_consonants() {
         assert!((x - y).abs() < 1e-9, "{x} against {y}");
     }
 }
+
+/// A consonant's posture: a gesture over each such consonant holding the named articulators,
+/// and nothing for the others.
+#[test]
+fn a_consonant_can_hold_a_posture_of_its_own() {
+    use chimera::anatomy::human::ArticKey;
+    use std::collections::BTreeMap;
+    let (notes, _, plain) = sing("strut bah", 1.0, 60.0);
+    let shape = BTreeMap::from([("s".to_string(), BTreeMap::from([("lipProt".to_string(), 0.0), ("lipWidth".to_string(), 1.0)]))]);
+    let p = plan_song(&notes, &SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, consonant_posture: Some(shape), ..Default::default() });
+    let held: Vec<_> = p.gestures.iter().filter(|g| g.label.as_ref().is_some_and(|l| l.as_str() == "posture")).collect();
+    let s = p.segments.iter().find(|s| s.ipa == "s").unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!((held[0].t0, held[0].t1), (s.t0, s.t1));
+    assert_eq!((held[0].targets.get(ArticKey::LipProt), held[0].targets.get(ArticKey::LipWidth), held[0].targets.get(ArticKey::Jaw)), (Some(0.0), Some(1.0), None));
+    assert_eq!(p.gestures.len(), plain.gestures.len() + 1);
+}

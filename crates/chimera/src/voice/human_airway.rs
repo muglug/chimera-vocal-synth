@@ -14,6 +14,11 @@ pub struct NoiseGains {
     pub glottis: f64,
     pub constriction: f64,
     pub teeth: f64,
+    /// the band of the teeth's noise (sibilants), Hz: low-pass and high-pass. 5000 and 1200 put
+    /// an s's noise around 4.5 kHz, a quarter of it above 4 kHz; a man's s is centred near 6 kHz
+    /// with four fifths of it above 4 kHz, which takes a band nearer 11000 and 3000.
+    pub teeth_lowpass: f64,
+    pub teeth_highpass: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -139,7 +144,7 @@ impl HumanAirway {
             frame: None,
             ph_len: 8.8,
             or_len: 8.3,
-            noise_gain: NoiseGains { glottis: 3.2e-6, constriction: 2.2e-6, teeth: 3.0e-6 },
+            noise_gain: NoiseGains { glottis: 3.2e-6, constriction: 2.2e-6, teeth: 3.0e-6, teeth_lowpass: 5000.0, teeth_highpass: 1200.0 },
             max_area_rate: 45.0,
             area_rate_gain: 40.0,
             seal_rate: 5.0,
@@ -315,7 +320,7 @@ impl HumanAirway {
                     let teeth_i = n_ph_i + js_min((n_or - 2) as f64, js_max(0.0, js_round((f.teeth_s - self.ph_len) / dx_or))) as isize;
                     let tb = to_branch(teeth_i);
                     if tb >= 0 {
-                        list.push(NoiseSpec::new(src as usize, tb as usize, bwd as usize, g.teeth * wt).band(5000.0, 1200.0));
+                        list.push(NoiseSpec::new(src as usize, tb as usize, bwd as usize, g.teeth * wt).band(g.teeth_lowpass, g.teeth_highpass));
                     }
                 }
             }

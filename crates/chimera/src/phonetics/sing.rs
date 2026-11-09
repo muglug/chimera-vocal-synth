@@ -123,6 +123,12 @@ pub struct SongOptions {
     /// to the minute is 119): a singer's are nearer 0.5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consonant_length: Option<f64>,
+    /// articulators held for a consonant, over its own gestures: consonant → articulator → value.
+    /// A sung consonant otherwise takes the lips of the vowels round it, and between rounded
+    /// (or shaded) vowels an s then has a long front cavity and hisses at 3-4 kHz, like a sh:
+    /// `{"s": {"lipProt": 0, "lipWidth": 1}}` spreads the lips for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consonant_posture: Option<BTreeMap<String, BTreeMap<String, f64>>>,
 }
 
 /// How a held vowel's vibrato comes in: none for `delay` seconds, then growing over `over`
@@ -308,6 +314,22 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             // blend by weight. So:
             let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
             let of = |g: &Gesture, label: &str, s: &PlannedSegment| g.label.as_ref().is_some_and(|l| l.as_str() == label) && same(g.t0, s.t0) && same(g.t1, s.t1);
+            // a consonant's own posture: a strong gesture over its span, so it wins over the
+            // vowels' reach into the consonant
+            if let Some(shapes) = &o.consonant_posture {
+                let mut held: Vec<Gesture> = Vec::new();
+                for s in plan.segments.iter().filter(|s| s.kind != "vowel") {
+                    let Some(shape) = shapes.get(&s.ipa) else { continue };
+                    let mut targets = Targets::default();
+                    for (name, x) in shape {
+                        if let Some(k) = crate::anatomy::human::ArticKey::from_name(name) {
+                            targets.set(k, *x);
+                        }
+                    }
+                    held.push(Gesture::new(s.t0, s.t1, 0.035, 0.035, 4.0, targets).label("posture"));
+                }
+                plan.gestures.append(&mut held);
+            }
             // shaded vowels: the vowel's gesture aims between its own articulation and the
             // other vowel's (first, while every gesture is still on its segment's span)
             if let Some(shades) = &o.vowels {

@@ -428,3 +428,97 @@ fn render_notes_tele_records_the_live_telemetry_without_changing_the_sound() {
     let a_lip = artic["frames"][96][lip].as_f64().unwrap(); // 0.96 s = 60 tele hops
     assert!((at(60, 11 + lip) as f64 - a_lip).abs() < 1e-3, "lipAp {} vs {a_lip}", at(60, 11 + lip));
 }
+
+/// A 16-bit WAV: (channels, the samples, interleaved).
+fn read_wav(path: &str) -> (usize, Vec<f64>) {
+    let b = std::fs::read(path).unwrap();
+    assert_eq!((&b[0..4], u16::from_le_bytes([b[34], b[35]])), (&b"RIFF"[..], 16), "{path}");
+    let channels = u16::from_le_bytes([b[22], b[23]]) as usize;
+    (channels, b[44..].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect())
+}
+
+fn rms(x: &[f64]) -> f64 {
+    (x.iter().map(|v| v * v).sum::<f64>() / x.len().max(1) as f64).sqrt()
+}
+
+/// A melody file's "source" sets the vocal folds: lax, breathy and dark on the male body (a
+/// falsetto) the same notes have less of their energy in the upper harmonics, so the wave changes
+/// more slowly for its level.
+#[test]
+fn render_notes_source_sets_the_vocal_folds() {
+    let melody = |source: &str| format!(r#"{{"bpm": 120, "t0": 0.2, "lyrics": "la la la", "notes": [[64, 1], [66, 1], [68, 2]]{source}}}"#);
+    let steepness = |name: &str, source: &str| {
+        let (input, out) = (tmp(&format!("{name}.json")), tmp(name));
+        std::fs::write(&input, melody(source)).unwrap();
+        chimera(&["render", "notes", &input, &out, "male"]);
+        let (channels, x) = read_wav(&format!("{out}.wav"));
+        assert_eq!(channels, 1);
+        let d: Vec<f64> = x.windows(2).map(|w| w[1] - w[0]).collect();
+        rms(&d) / rms(&x)
+    };
+    let modal = steepness("source-modal", "");
+    let falsetto = steepness("source-falsetto", r#", "source": {"tension": 0.15, "breathiness": 0.5, "brightness": 0.05}"#);
+    assert!(falsetto < 0.93 * modal, "falsetto {falsetto} against the sung default {modal}");
+
+    let input = tmp("source-bad.json");
+    std::fs::write(&input, melody(r#", "source": {"tension": "high"}"#)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_chimera")).args(["render", "notes", &input, &tmp("source-bad")]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("source: "), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// One file in, the duet page's folder out: each voice's melody and telemetry, the stereo mix
+/// with every voice from sample 0 at its pan, and show.json.
+#[test]
+fn render_show_writes_each_voice_the_stereo_mix_and_the_show_file() {
+    let (input, dir) = (tmp("show.json"), tmp("show-out"));
+    // the upper voice rests two beats (1 s) while the lower sings, then they swap
+    std::fs::write(
+        &input,
+        r#"{"title": "Two apart", "bpm": 120, "t0": 0.25, "spell": {"lah": "la"},
+            "voices": [
+              {"name": "Alto 1", "pan": -1, "vibrato": 10, "source": {"tension": 0.15, "breathiness": 0.5}, "lyrics": "la la", "notes": [[0, 2], [64, 1], [66, 1]]},
+              {"name": "Bass", "pan": 1, "lyrics": "la la", "notes": [[45, 1], [47, 1], [0, 2]]}]}"#,
+    )
+    .unwrap();
+    let stdout = chimera(&["render", "show", &input, &dir]);
+    assert!(stdout.contains("2 voices"), "{stdout}");
+
+    let show: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/show.json")).unwrap()).unwrap();
+    assert_eq!(
+        show,
+        serde_json::json!({"title": "Two apart", "audio": "mix.wav", "bpm": 120.0, "downbeat": 0.25, "spell": {"lah": "la"},
+            "voices": [{"name": "Alto 1", "tele": "alto-1.tele", "melody": "alto-1.json"}, {"name": "Bass", "tele": "bass.tele", "melody": "bass.json"}]})
+    );
+    // a voice's melody is what `render notes` sings: the show's tempo and start, its own source
+    let alto: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/alto-1.json")).unwrap()).unwrap();
+    assert_eq!((alto["bpm"].as_f64(), alto["t0"].as_f64(), alto["vibrato"].as_f64()), (Some(120.0), Some(0.25), Some(10.0)));
+    assert_eq!(alto["source"]["breathiness"].as_f64(), Some(0.5));
+    assert_eq!(alto["notes"], serde_json::json!([[0, 2], [64, 1], [66, 1]]));
+
+    let (channels, mix) = read_wav(&format!("{dir}/mix.wav"));
+    assert_eq!(channels, 2);
+    let frames = mix.len() / 2;
+    let side = |k: usize, from: f64, to: f64| rms(&mix[2 * (from * 48000.0) as usize..2 * (to * 48000.0) as usize].iter().skip(k).step_by(2).copied().collect::<Vec<_>>());
+    // 0.4-1.1 s: only the bass, on the right; 1.4-2.1 s: only the alto, on the left
+    assert!(side(1, 0.4, 1.1) > 1000.0 && side(0, 0.4, 1.1) < 3.0, "bass: left {} right {}", side(0, 0.4, 1.1), side(1, 0.4, 1.1));
+    assert!(side(0, 1.4, 2.1) > 1000.0 && side(1, 1.4, 2.1) < 30.0, "alto: left {} right {}", side(0, 1.4, 2.1), side(1, 1.4, 2.1));
+    // scaled to a -1 dB peak
+    let peak = mix.iter().fold(0.0f64, |p, v| p.max(v.abs()));
+    assert!((peak - 0.891 * 32767.0).abs() < 2.0, "peak {peak}");
+
+    // each voice's telemetry runs on the mix's clock (the longer voice ends the mix)
+    let tele = |name: &str| {
+        let t = std::fs::read(format!("{dir}/{name}.tele")).unwrap();
+        assert_eq!(&t[0..4], b"CHTL");
+        u32::from_le_bytes(t[16..20].try_into().unwrap()) as usize
+    };
+    assert_eq!(tele("alto-1"), 1 + frames / 768);
+    assert!(tele("bass") < tele("alto-1"));
+
+    // two voices whose files would share a name
+    std::fs::write(&input, r#"{"title": "x", "bpm": 120, "voices": [{"name": "Alto 1", "lyrics": "la", "notes": [[60, 1]]}, {"name": "alto-1", "lyrics": "la", "notes": [[60, 1]]}]}"#).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_chimera")).args(["render", "show", &input, &dir]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"alto-1\""), "{}", String::from_utf8_lossy(&out.stderr));
+}

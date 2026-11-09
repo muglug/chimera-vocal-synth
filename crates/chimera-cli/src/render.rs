@@ -10,7 +10,7 @@ use chimera::control::score::Gesture;
 use chimera::creatures::types::ParamRole;
 use chimera::creatures::voice::CreatureVoice;
 use chimera::creatures::{CREATURES, creature_by_id};
-use chimera::math::{js_max, js_min, js_round, log10};
+use chimera::math::{PI, cos, js_max, js_min, js_round, log10, sin};
 use chimera::phonetics::beatbox::{BEAT_PRESETS, BEAT_SOUNDS, BeatStep, beat_ready, parse_beat};
 use chimera::phonetics::english::EnglishG2P;
 use chimera::phonetics::ipa::tokenize_ipa;
@@ -478,39 +478,31 @@ fn render_tracked(v: &mut HumanVoice, out: &mut [f32], artic: bool, tele: bool) 
     Ok((frames, rec))
 }
 
-/// A melody from a JSON file: `{"bpm", "lyrics", "notes": [[midi, beats], ...], "vibrato"?}`.
+/// A melody sung: the samples, and what was recorded along the way.
+struct Sung {
+    out: Vec<f32>,
+    /// articulator frames (`--artic`)
+    frames: Vec<Vec<f64>>,
+    rec: Option<TeleRecorder>,
+    sounding: usize,
+}
+
+/// Sing a melody: `{"bpm", "lyrics", "notes": [[midi, beats], ...], "t0"?, "vibrato"?, "source"?}`.
 /// One lyric syllable per sounding note; a note with midi <= 0 is a rest, which splits the
-/// melody into phrases planned separately on one voice.
-/// `render notes <in.json> <out> [body] [--artic tracks.json] [--tele voice.tele]`: `--artic` also
-/// writes the articulators over time (`{"rate", "body", "keys", "frames"}`), to animate a face in
-/// sync; `--tele` writes the voice's whole telemetry over time (see `TeleRecorder`), which the
-/// app's duet page replays on a 3D head.
-pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
-    let mut artic_out: Option<String> = None;
-    let mut tele_out: Option<String> = None;
-    let mut rest = Vec::new();
-    let mut it = a.iter();
-    while let Some(x) = it.next() {
-        if x == "--artic" {
-            artic_out = Some(it.next().ok_or("--artic needs a file")?.clone());
-        } else if x == "--tele" {
-            tele_out = Some(it.next().ok_or("--tele needs a file")?.clone());
-        } else {
-            rest.push(x.clone());
-        }
-    }
-    let a = &rest[..];
-    let input = a.first().ok_or("render notes <in.json> <out> [male|female|child] [--artic tracks.json] [--tele voice.tele]")?;
-    let out_name = wav_name(arg(a, 1, "out/notes"));
-    let body_name = arg(a, 2, "male");
+/// melody into phrases planned separately on one voice. `source` sets the vocal folds for the
+/// whole melody (a `SourcePatch`: tension, breathiness, brightness, pressure, roughness...), over
+/// the sung default (pressure 9, tension 0.55): a lax, breathy, dark source on the male body is
+/// a falsetto (`{"tension": 0.2, "breathiness": 0.45, "brightness": 0.1}`).
+fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tele: bool) -> Result<Sung, String> {
     let b = body(body_name)?;
-    let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
-    let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{input}: {e}"))?;
     let bpm = j["bpm"].as_f64().ok_or("bpm missing")?;
     let vibrato = j["vibrato"].as_f64().unwrap_or(35.0);
     let raw: Vec<[f64; 2]> = serde_json::from_value(j["notes"].clone()).map_err(|e| format!("notes: {e}"))?;
-    let g = g2p()?;
-    let syl = lyrics_to_syllables(j["lyrics"].as_str().ok_or("lyrics missing")?, &g);
+    let source: SourcePatch = match j.get("source") {
+        Some(s) if !s.is_null() => serde_json::from_value(s.clone()).map_err(|e| format!("source: {e}"))?,
+        _ => SourcePatch::default(),
+    };
+    let syl = lyrics_to_syllables(j["lyrics"].as_str().ok_or("lyrics missing")?, g);
     let sounding = raw.iter().filter(|n| n[0] > 0.0).count();
     if syl.len() != sounding {
         return Err(format!("{} syllables for {sounding} notes: {}", syl.len(),
@@ -527,6 +519,7 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         tension: Some(0.55),
         ..Default::default()
     });
+    v.set_source(&SourcePatch { f0: None, voiced: None, ..source });
     let (mut t, mut k, mut end) = (t0, 0usize, 0.0f64);
     let mut phrase: Vec<SungNote> = Vec::new();
     let mut start = t;
@@ -554,14 +547,42 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     flush(&mut phrase, start, &mut v, &mut end);
     let n = js_round(FS * (end + 0.4)) as usize;
     let mut out = vec![0f32; n];
-    let (frames, rec) = if artic_out.is_some() || tele_out.is_some() {
-        render_tracked(&mut v, &mut out, artic_out.is_some(), tele_out.is_some())?
+    let (frames, rec) = if artic || tele {
+        render_tracked(&mut v, &mut out, artic, tele)?
     } else {
         render_blocks(&mut v, &mut out);
         (Vec::new(), None)
     };
+    Ok(Sung { out, frames, rec, sounding })
+}
+
+/// `render notes <in.json> <out> [body] [--artic tracks.json] [--tele voice.tele]`: sing a melody
+/// file (see [`sing`]). `--artic` also writes the articulators over time (`{"rate", "body", "keys",
+/// "frames"}`), to animate a face in sync; `--tele` writes the voice's whole telemetry over time
+/// (see `TeleRecorder`), which the app's duet page replays on a 3D head.
+pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
+    let mut artic_out: Option<String> = None;
+    let mut tele_out: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut it = a.iter();
+    while let Some(x) = it.next() {
+        if x == "--artic" {
+            artic_out = Some(it.next().ok_or("--artic needs a file")?.clone());
+        } else if x == "--tele" {
+            tele_out = Some(it.next().ok_or("--tele needs a file")?.clone());
+        } else {
+            rest.push(x.clone());
+        }
+    }
+    let a = &rest[..];
+    let input = a.first().ok_or("render notes <in.json> <out> [male|female|child] [--artic tracks.json] [--tele voice.tele]")?;
+    let out_name = wav_name(arg(a, 1, "out/notes"));
+    let body_name = arg(a, 2, "male");
+    let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
+    let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{input}: {e}"))?;
+    let Sung { out, frames, rec, sounding } = sing(&j, body_name, &g2p()?, artic_out.is_some(), tele_out.is_some())?;
     ctx.write_wav(&out_name, &out)?;
-    println!("{out_name}: {} s, peak {}, {} notes", fixed(n as f64 / FS, 2), fixed(peak(&out), 3), sounding);
+    println!("{out_name}: {} s, peak {}, {} notes", fixed(out.len() as f64 / FS, 2), fixed(peak(&out), 3), sounding);
     if let Some(path) = &artic_out {
         let j = serde_json::json!({"rate": ARTIC_RATE, "body": body_name, "keys": ArticKey::NAMES, "frames": frames});
         std::fs::write(path, j.to_string()).map_err(|e| format!("{path}: {e}"))?;
@@ -571,6 +592,116 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         std::fs::write(path, r.bytes(body_mix(body_name)?)).map_err(|e| format!("{path}: {e}"))?;
         println!("{path}: {} telemetry frames every {TELE_HOP} samples", r.frames);
     }
+    Ok(())
+}
+
+/// The level of a voice while it sounds (dB re full scale): the RMS of its 20 ms frames within
+/// 40 dB of the loudest, so rests don't count.
+fn sounding_db(x: &[f32]) -> f64 {
+    let frames: Vec<f64> = x.chunks(FS as usize / 50).map(|c| c.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / c.len() as f64).collect();
+    let top = frames.iter().fold(0.0f64, |p, &v| js_max(p, v));
+    let loud: Vec<f64> = frames.into_iter().filter(|&v| v > top * 1e-4).collect();
+    if loud.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+    10.0 * log10(loud.iter().sum::<f64>() / loud.len() as f64)
+}
+
+/// `render show <show.json> <outdir>`: a whole show for the app's duet page from one file, any
+/// number of voices. With `<outdir>` = `public/shows/<id>` it plays at `?show=<id>`.
+///
+///   { "title": "…", "bpm": 120, "t0"?: 0.3, "downbeat"?: s, "spell"?: {"dum": "dm"},
+///     "voices": [{ "name": "Bass", "lyrics": "…", "notes": [[midi, beats], …],
+///                  "body"?: "male", "source"?: {…}, "vibrato"?: 35, "gain"?: 1, "pan"?: 0 }, …] }
+///
+/// Each voice is a melody as `render notes` sings it (see [`sing`]), all on the show's `bpm` and
+/// `t0`, so they share sample 0. Written: per voice `<name>.json` (its melody, for the words at
+/// its mouth) and `<name>.tele`; `mix.wav` (stereo: each voice at its `gain`, panned −1 left … 1
+/// right, the sum scaled to a −1 dB peak); and `show.json`. The voices render side by side.
+pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
+    const USAGE: &str = "render show <show.json> <outdir>";
+    let input = a.first().ok_or(USAGE)?;
+    let out_dir = a.get(1).ok_or(USAGE)?;
+    let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
+    let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{input}: {e}"))?;
+    let title = j["title"].as_str().ok_or("title missing")?;
+    let bpm = j["bpm"].as_f64().ok_or("bpm missing")?;
+    let t0 = j["t0"].as_f64().unwrap_or(0.3);
+    struct Voice {
+        name: String,
+        id: String,
+        body: String,
+        melody: serde_json::Value,
+        gain: f64,
+        pan: f64,
+    }
+    let mut voices: Vec<Voice> = Vec::new();
+    for (i, v) in j["voices"].as_array().ok_or("voices missing")?.iter().enumerate() {
+        let name = v["name"].as_str().ok_or(format!("voice {}: name missing", i + 1))?;
+        // the files' name: the voice's, in lower-case letters and digits ("Alto 1" → alto-1)
+        let id = name.to_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join("-");
+        if id.is_empty() || matches!(id.as_str(), "show" | "mix") || voices.iter().any(|o| o.id == id) {
+            return Err(format!("voice {name:?}: its files would be named {id:?}, which is taken or empty"));
+        }
+        let body_name = v["body"].as_str().unwrap_or("male");
+        body(body_name)?;
+        let mut melody = serde_json::json!({"bpm": bpm, "t0": t0, "lyrics": v["lyrics"], "notes": v["notes"]});
+        for k in ["vibrato", "source"] {
+            if let Some(x) = v.get(k) {
+                melody[k] = x.clone();
+            }
+        }
+        voices.push(Voice { name: name.into(), id, body: body_name.into(), melody, gain: v["gain"].as_f64().unwrap_or(1.0), pan: v["pan"].as_f64().unwrap_or(0.0).clamp(-1.0, 1.0) });
+    }
+    if voices.is_empty() {
+        return Err("a show needs a voice".into());
+    }
+    let g = g2p()?;
+    let t_start = Instant::now();
+    let sung: Vec<Result<Sung, String>> = std::thread::scope(|s| {
+        let jobs: Vec<_> = voices.iter().map(|v| s.spawn(|| sing(&v.melody, &v.body, &g, false, true))).collect();
+        jobs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("the render panicked".into()))).collect()
+    });
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
+    let mut parts: Vec<Sung> = Vec::new();
+    for (v, r) in voices.iter().zip(sung) {
+        let r = r.map_err(|e| format!("{}: {e}", v.name))?;
+        let (tele, melody) = (format!("{out_dir}/{}.tele", v.id), format!("{out_dir}/{}.json", v.id));
+        let rec = r.rec.as_ref().ok_or("no telemetry")?;
+        std::fs::write(&tele, rec.bytes(body_mix(&v.body)?)).map_err(|e| format!("{tele}: {e}"))?;
+        std::fs::write(&melody, v.melody.to_string()).map_err(|e| format!("{melody}: {e}"))?;
+        println!("{}  {} notes  {} s  {} dB while sounding (peak {})", pad_end(&v.name, 12), pad_start(&r.sounding.to_string(), 5), fixed(r.out.len() as f64 / FS, 1), fixed(sounding_db(&r.out), 1), fixed(peak(&r.out), 3));
+        parts.push(r);
+    }
+    // the mix: constant-power panning, then one scale for the whole track
+    let n = parts.iter().map(|p| p.out.len()).max().unwrap_or(0);
+    let mut mix = vec![0f64; 2 * n];
+    for (v, p) in voices.iter().zip(&parts) {
+        let a = (v.pan + 1.0) * PI / 4.0;
+        let (l, r) = (v.gain * cos(a), v.gain * sin(a));
+        for (i, &x) in p.out.iter().enumerate() {
+            mix[2 * i] += l * x as f64;
+            mix[2 * i + 1] += r * x as f64;
+        }
+    }
+    let top = mix.iter().fold(0.0f64, |p, &v| js_max(p, v.abs()));
+    let k = if top > 0.0 { 0.891 / top } else { 1.0 };
+    let mix: Vec<f32> = mix.iter().map(|&v| (v * k) as f32).collect();
+    let audio = format!("{out_dir}/mix.wav");
+    ctx.write_wav_stereo(&audio, &mix)?;
+    let mut show = serde_json::json!({
+        "title": title,
+        "audio": "mix.wav",
+        "bpm": bpm,
+        "downbeat": j["downbeat"].as_f64().unwrap_or(t0),
+        "voices": voices.iter().map(|v| serde_json::json!({"name": v.name, "tele": format!("{}.tele", v.id), "melody": format!("{}.json", v.id)})).collect::<Vec<_>>(),
+    });
+    if let Some(spell) = j.get("spell") {
+        show["spell"] = spell.clone();
+    }
+    let path = format!("{out_dir}/show.json");
+    std::fs::write(&path, show.to_string()).map_err(|e| format!("{path}: {e}"))?;
+    println!("{audio}: {} voices, {} s, mixed {} dB, rendered in {} s", voices.len(), fixed(n as f64 / FS, 1), fixed(20.0 * log10(k), 1), fixed(ms_since(t_start) / 1000.0, 1));
     Ok(())
 }
 

@@ -20,7 +20,10 @@ usage: chimera <command> [args] [--float]
   render text    <out> [\"English text.\"] [male|female|child]
   render song    [outdir] [male|female|child]
   render notes   <in.json> <out> [male|female|child] [--artic tracks.json] [--tele voice.tele]
-                 (melody file; midi <= 0 is a rest; --artic also writes the articulators at 100 Hz)
+                 (melody file; midi <= 0 is a rest; --artic also writes the articulators at 100 Hz;
+                 the file's \"source\" sets the vocal folds, e.g. a falsetto)
+  render show    <show.json> <outdir>
+                 (every voice of a show, its telemetry and the stereo mix: the duet page's folder)
   render beatbox [outdir] [preset name | pattern] [male|female|child] [bpm] [bars]
   render creature [creatureId] [outdir]
   render vowels  [male|female|child] [out]
@@ -52,6 +55,11 @@ pub struct Ctx {
 impl Ctx {
     pub fn write_wav(&self, path: &str, x: &[f32]) -> Result<(), String> {
         wav::write(path, x, FS as u32, self.float).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// `x` is left and right, interleaved.
+    pub fn write_wav_stereo(&self, path: &str, x: &[f32]) -> Result<(), String> {
+        wav::write_channels(path, x, FS as u32, 2, self.float).map_err(|e| format!("{path}: {e}"))
     }
 }
 
@@ -103,6 +111,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 "text" => render::text(&ctx, rest),
                 "song" => render::song(&ctx, rest),
                 "notes" => render::notes(&ctx, rest),
+                "show" => render::show(&ctx, rest),
                 "beatbox" => render::beatbox(&ctx, rest),
                 "creature" => render::creature(&ctx, rest),
                 "vowels" => render::vowels(&ctx, rest),

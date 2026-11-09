@@ -338,3 +338,25 @@ fn a_vowel_can_open_slowly_out_of_an_r() {
     // after the d nothing changes
     assert_eq!((v(&plain, "i").t0, v(&plain, "i").ramp_in), (v(&slow, "i").t0, v(&slow, "i").ramp_in));
 }
+
+/// A phrase's last nasal: unset it is a coda like any other; set, it is held (0.4 of the note at
+/// most) and its closure outlasts the breath.
+#[test]
+fn a_phrase_can_close_onto_its_last_nasal() {
+    use chimera::phonetics::{Segment, Syllable};
+    let home = Syllable { text: "home".into(), onset: vec![Segment::new("h")], nucleus: Segment::new("oʊ"), coda: vec![Segment::new("m")], melisma: None, word_end: true, phrase_end: false };
+    let notes = vec![SungNote { midi: 56.0, beats: 2.0, syl: home }];
+    let base = SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, ..Default::default() };
+    let (plain, held) = (plan_song(&notes, &base), plan_song(&notes, &SongOptions { final_nasal: Some(0.25), ..base.clone() }));
+    let m = |p: &Plan| p.segments.iter().find(|s| s.ipa == "m").cloned().unwrap();
+    assert!(m(&plain).t1 - m(&plain).t0 < 0.07, "plain: {}", m(&plain).t1 - m(&plain).t0);
+    assert!((m(&held).t1 - m(&held).t0 - 0.25).abs() < 1e-9, "held: {}", m(&held).t1 - m(&held).t0);
+    // the note still ends where it did, and the lips stay shut past the end of the breath
+    assert!((m(&held).t1 - m(&plain).t1).abs() < 1e-9);
+    let closed = held.gestures.iter().filter(|g| g.label.as_ref().is_some_and(|l| l.as_str() == "m")).map(|g| g.t1).fold(f64::MIN, f64::max);
+    let breath = held.gestures.iter().find(|g| g.label.as_ref().is_some_and(|l| l.as_str() == "breath")).unwrap();
+    assert!(closed > breath.t1 + breath.ramp_out, "the lips open at {closed}, the breath falls until {}", breath.t1 + breath.ramp_out);
+    // a short note: 0.4 of it
+    let short = plan_song(&[SungNote { beats: 0.5, ..notes[0].clone() }], &SongOptions { final_nasal: Some(0.25), ..base.clone() });
+    assert!((m(&short).t1 - m(&short).t0 - 0.2).abs() < 1e-9, "short: {}", m(&short).t1 - m(&short).t0);
+}

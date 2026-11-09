@@ -157,6 +157,12 @@ pub struct SongOptions {
     /// on a sung r is heard as an attack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glide_in: Option<f64>,
+    /// a phrase that ends on a nasal ("home", "roam") closes onto it for this long (s; at most
+    /// 0.4 of the last note), and the lips stay shut while the breath stops, as for a hum. None:
+    /// the nasal has a coda's length (under 60 ms) and the mouth opens on the last of the voice:
+    /// "home-uh". A singer's "home" on a short note is half m.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_nasal: Option<f64>,
 }
 
 /// How a held vowel's vibrato comes in: none for `delay` seconds, then growing over `over`
@@ -284,6 +290,13 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
         // the phrase's last vowel leaves a short breath before the next phrase. The call's last
         // phrase is followed by a rest (callers split phrases at rests), so the breath comes from
         // the rest: hold that note to its end, less the breath's release.
+        // a phrase's last nasal is held
+        if let Some(hold) = o.final_nasal
+            && let Some(c) = codas[j - i].last_mut()
+            && phoneme(&c.ipa, o.body).is_some_and(|d| d.manner == Manner::Nasal)
+        {
+            c.dur = Some(js_max(c.dur.unwrap_or(0.0), js_min(hold, 0.4 * notes[j].beats * beat)));
+        }
         let reserve = if j == notes.len() - 1 { 0.05 } else { 0.12 };
         let last_end = times[j] + notes[j].beats * beat - js_min(reserve, 0.3 * notes[j].beats * beat);
         for k in i..=j {
@@ -415,6 +428,10 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             // a hum keeps its closure (the gestures labelled with it that end with its span)
             // while the breath stops at the end of a phrase, and into a consonant after it, so
             // the mouth does not open on the voice between the two
+            // (and so does a phrase's held last nasal)
+            if o.final_nasal.is_some() && plan.segments.last().is_some_and(|s| s.kind == "nasal") && !hums.contains(&(plan.segments.len() - 1)) {
+                hums.push(plan.segments.len() - 1);
+            }
             for &at in &hums {
                 let seg = plan.segments[at].clone();
                 let hold = match plan.segments.get(at + 1) {

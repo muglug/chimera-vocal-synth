@@ -569,3 +569,43 @@ fn render_show_speaks_a_melodys_lines_in_their_own_rhythm_and_in_time() {
     assert!(level(1.0, 1.9) > 1500.0, "the line: {}", level(1.0, 1.9));
     assert!(level(2.75, 3.05) < 60.0, "after it: {}", level(2.75, 3.05));
 }
+
+/// A voice's "levels" move it in the mix over time: full until beat 3, half from beat 3.5.
+#[test]
+fn render_show_levels_move_a_voice_in_the_mix() {
+    let (input, dir) = (tmp("levels.json"), tmp("levels-out"));
+    // one note of 8 beats (4 s) from 0.2 s; the level falls between 1.7 and 1.95 s
+    std::fs::write(&input, r#"{"title": "Down", "bpm": 120, "t0": 0.2, "voices": [{"name": "Solo", "vibrato": 0, "lyrics": "la", "notes": [[57, 8]], "levels": [[0, 1], [3, 1], [3.5, 0.5]]}]}"#).unwrap();
+    chimera(&["render", "show", &input, &dir]);
+    let (_, mix) = read_wav(&format!("{dir}/mix.wav"));
+    let level = |from: f64, to: f64| rms(&mix[2 * (from * 48000.0) as usize..2 * (to * 48000.0) as usize]);
+    let ratio = level(2.2, 3.4) / level(0.6, 1.6);
+    assert!((ratio - 0.5).abs() < 0.04, "the second half is at {ratio} of the first");
+
+    std::fs::write(&input, r#"{"title": "x", "bpm": 120, "voices": [{"name": "Solo", "lyrics": "la", "notes": [[57, 1]], "levels": [[2, 1], [1, 0.5]]}]}"#).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_chimera")).args(["render", "show", &input, &dir]).output().unwrap();
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("levels"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A melody's "pronounce" replaces the dictionary's entry for a word: the same notes and spelling
+/// sound different, and still one syllable to a note.
+#[test]
+fn render_notes_pronounce_overrides_the_dictionary() {
+    let render = |name: &str, extra: &str| {
+        let (input, out) = (tmp(&format!("{name}.json")), tmp(name));
+        std::fs::write(&input, format!(r#"{{"bpm": 120, "t0": 0.2, "lyrics": "worries", "notes": [[57, 1], [55, 1]]{extra}}}"#)).unwrap();
+        let o = Command::new(env!("CARGO_BIN_EXE_chimera")).args(["render", "notes", &input, &out]).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stderr).to_string(), std::fs::read(format!("{out}.wav")).unwrap_or_default())
+    };
+    let (ok, _, american) = render("say-us", "");
+    assert!(ok);
+    let (ok, err, british) = render("say-gb", r#", "pronounce": {"Worries": "W AH1 R IY0 Z"}"#);
+    assert!(ok, "{err}");
+    assert_eq!(american.len(), british.len());
+    assert!(american != british, "the pronunciation made no difference");
+    // three syllables for two notes
+    let (ok, err, _) = render("say-3", r#", "pronounce": {"worries": "W AH1 R IY0 AH0 Z"}"#);
+    assert!(!ok && err.starts_with("3 syllables for 2 notes"), "{err}");
+    let (ok, err, _) = render("say-bad", r#", "pronounce": {"worries": 3}"#);
+    assert!(!ok && err.starts_with("pronounce: "), "{err}");
+}

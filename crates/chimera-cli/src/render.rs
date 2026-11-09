@@ -18,8 +18,8 @@ use chimera::phonetics::planner::{
     PhraseInput, PlanOptions, expand, plan_phrases, plan_utterance, vowel_table,
 };
 use chimera::phonetics::sing::{
-    LegatoFrom, NoteOnOptions, SongOptions, SungNote, midi_to_hz, plan_note_off, plan_note_on,
-    plan_song,
+    Diphthongs, LegatoFrom, NoteOnOptions, SongOptions, SungNote, midi_to_hz, plan_note_off,
+    plan_note_on, plan_song,
 };
 use chimera::phonetics::songs::DEMO_SONGS;
 use chimera::phonetics::syllables::lyrics_to_syllables;
@@ -37,12 +37,31 @@ fn render_blocks(v: &mut HumanVoice, out: &mut [f32]) {
 
 /// The CMU dictionary (`public/data/cmudict.txt.gz`) loaded into a G2P.
 pub fn g2p() -> Result<EnglishG2P, String> {
+    g2p_saying(None)
+}
+
+/// The dictionary with a melody's or show's own pronunciations over it: `"pronounce": {"word":
+/// "W ER1 D"}` in the dictionary's notation. The dictionary is American and lists a word's
+/// commonest form first: "worries" has the r-coloured vowel (British: "W AH1 R IY0 Z") and "and"
+/// its weak form (sung: "AE1 N D").
+fn g2p_saying(pronounce: Option<&serde_json::Value>) -> Result<EnglishG2P, String> {
     let path = repo_path("public/data/cmudict.txt.gz");
     let gz = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
     let mut text = String::new();
     flate2::read::GzDecoder::new(&gz[..])
         .read_to_string(&mut text)
         .map_err(|e| format!("{path}: {e}"))?;
+    match pronounce {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Object(words)) => {
+            // later lines replace earlier ones
+            for (word, phones) in words {
+                let phones = phones.as_str().ok_or(format!("pronounce: {word:?} is not a string of phones"))?;
+                text.push_str(&format!("\n{}\t{}", word.to_lowercase(), phones.trim()));
+            }
+        }
+        Some(_) => return Err("pronounce: not an object of word: phones".into()),
+    }
     let mut g = EnglishG2P::new();
     g.load_dict(&text);
     Ok(g)
@@ -507,6 +526,8 @@ const SPEECH_LEAD: f64 = 0.06;
 struct Line {
     start: f64,
     end: f64,
+    /// its speaking pitch (Hz)
+    f0: f64,
     gestures: Vec<Gesture>,
     words: Vec<(f64, f64, String)>,
 }
@@ -569,11 +590,12 @@ fn plan_line(j: &serde_json::Value, g: &EnglishG2P, body_name: &str, t0: f64, be
             from = None;
         }
     }
-    Ok(Line { start, end: plan.end, gestures: plan.gestures, words })
+    Ok(Line { start, end: plan.end, f0, gestures: plan.gestures, words })
 }
 
 /// Sing a melody: `{"bpm", "lyrics", "notes": [[midi, beats], ...], "t0"?, "vibrato"?, "source"?,
-/// "speech"?, "speechSource"?}`. One lyric syllable per sounding note; a note with midi <= 0 is a rest, which
+/// "speech"?, "speechSource"?, "diphthongs"?, "melismaLead"?, "pronounce"?}` (`pronounce`: see
+/// [`g2p_saying`]; the caller loads it). One lyric syllable per sounding note; a note with midi <= 0 is a rest, which
 /// splits the melody into phrases planned separately on one voice. `source` sets the vocal folds
 /// for the singing (a `SourcePatch`: tension, breathiness, brightness, pressure, roughness...),
 /// over the sung default (pressure 9, tension 0.55): a lax, breathy, dark source on the male body
@@ -582,6 +604,9 @@ fn plan_line(j: &serde_json::Value, g: &EnglishG2P, body_name: &str, t0: f64, be
 /// voice: the vocal folds go back to the engine's default for a line, with `speechSource` over
 /// it (`{"pressure": 13}` projects the line over other singers: at the default 8 cmH2O speech is
 /// some 9 dB under the singing), and to the sung source after it.
+/// `diphthongs` (`{"glide": 0.5, "open": "ɑ"}`) and `melismaLead` (seconds) are the song
+/// planner's options of those names (`SongOptions`): diphthongs that glide over the last part of
+/// their note, from a darker vowel, and slurred notes whose pitch is there on the beat.
 fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tele: bool) -> Result<Sung, String> {
     let b = body(body_name)?;
     let bpm = j["bpm"].as_f64().ok_or("bpm missing")?;
@@ -591,6 +616,11 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         Some(s) if !s.is_null() => serde_json::from_value(s.clone()).map_err(|e| format!("source: {e}"))?,
         _ => SourcePatch::default(),
     };
+    let diphthongs: Option<Diphthongs> = match j.get("diphthongs") {
+        Some(d) if !d.is_null() => Some(serde_json::from_value(d.clone()).map_err(|e| format!("diphthongs: {e}"))?),
+        _ => None,
+    };
+    let melisma_lead = j["melismaLead"].as_f64();
     let syl = lyrics_to_syllables(j["lyrics"].as_str().ok_or("lyrics missing")?, g);
     let sounding = raw.iter().filter(|n| n[0] > 0.0).count();
     if syl.len() != sounding {
@@ -631,8 +661,17 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         spoken.extend(l.words.iter().cloned());
         let at = |t: f64| js_round(FS * js_max(0.0, t)) as usize;
         if l.start - 0.03 > until + 0.25 {
-            sources.push((at(l.start - 0.03), speaking));
-            sources.push((at(l.end + 0.05), singing));
+            // with the voice's resting pitch at the line's: the planner's pitch gestures blend
+            // with it wherever they are weak (between words, at a phrase's edges), and the
+            // resting pitch of a sung melody is its first note's, which for a high voice pulled
+            // every gap in a spoken line up towards it
+            // The resting pitch goes first, in the silence before the line (after the last
+            // change, 0.3 s ahead at most): it glides, and gliding from a sung note's pitch as
+            // the line began made each line start with a swoop down.
+            let early = sources.last().map_or(0, |c| c.0).max(at(l.start - 0.3));
+            sources.push((early, SourcePatch { f0: Some(l.f0), ..Default::default() }));
+            sources.push((at(l.start - 0.03).max(early), speaking));
+            sources.push((at(l.end + 0.05), SourcePatch { f0: Some(v.source.f0), ..singing }));
         } else if let Some(last) = sources.last_mut() {
             last.0 = at(l.end + 0.05);
         }
@@ -645,7 +684,7 @@ fn sing(j: &serde_json::Value, body_name: &str, g: &EnglishG2P, artic: bool, tel
         if phrase.is_empty() {
             return;
         }
-        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, ..Default::default() });
+        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, diphthongs: diphthongs.clone(), melisma_lead });
         v.schedule(&plan.gestures);
         *end = js_max(*end, plan.end);
         phrase.clear();
@@ -698,7 +737,7 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     let body_name = arg(a, 2, "male");
     let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
     let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{input}: {e}"))?;
-    let Sung { out, frames, rec, sounding, spoken } = sing(&j, body_name, &g2p()?, artic_out.is_some(), tele_out.is_some())?;
+    let Sung { out, frames, rec, sounding, spoken } = sing(&j, body_name, &g2p_saying(j.get("pronounce"))?, artic_out.is_some(), tele_out.is_some())?;
     ctx.write_wav(&out_name, &out)?;
     println!("{out_name}: {} s, peak {}, {} notes{}", fixed(out.len() as f64 / FS, 2), fixed(peak(&out), 3), sounding, if spoken.is_empty() { String::new() } else { format!(", {} spoken words", spoken.len()) });
     if let Some(path) = &artic_out {
@@ -729,13 +768,17 @@ fn sounding_db(x: &[f32]) -> f64 {
 /// number of voices. With `<outdir>` = `public/shows/<id>` it plays at `?show=<id>`.
 ///
 ///   { "title": "…", "bpm": 120, "t0"?: 0.3, "downbeat"?: s, "spell"?: {"dum": "dm"}, "bowTie"?: true,
+///     "pronounce"?: {"worries": "W AH1 R IY0 Z"},
 ///     "voices": [{ "name": "Bass", "lyrics": "…", "notes": [[midi, beats], …],
-///                  "body"?: "male", "source"?: {…}, "speech"?: […], "vibrato"?: 35, "gain"?: 1, "pan"?: 0 }, …] }
+///                  "body"?: "male", "source"?: {…}, "speech"?: […], "vibrato"?: 35, "gain"?: 1, "pan"?: 0, "levels"?: […] }, …] }
 ///
 /// Each voice is a melody as `render notes` sings it (see [`sing`]), all on the show's `bpm` and
 /// `t0`, so they share sample 0. Written: per voice `<name>.json` (its melody, for the words at
 /// its mouth) and `<name>.tele`; `mix.wav` (stereo: each voice at its `gain`, panned −1 left … 1
 /// right, the sum scaled to a −1 dB peak); and `show.json`. The voices render side by side.
+/// A voice's `"levels": [[beat, level], …]` moves it in the mix as the piece goes (straight lines
+/// between the breakpoints, on top of `gain`): the voice with the tune up, the ones humming under
+/// it down.
 pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     const USAGE: &str = "render show <show.json> <outdir>";
     let input = a.first().ok_or(USAGE)?;
@@ -752,6 +795,8 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         melody: serde_json::Value,
         gain: f64,
         pan: f64,
+        /// (time s, level) breakpoints
+        levels: Vec<(f64, f64)>,
     }
     let mut voices: Vec<Voice> = Vec::new();
     for (i, v) in j["voices"].as_array().ok_or("voices missing")?.iter().enumerate() {
@@ -764,17 +809,29 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         let body_name = v["body"].as_str().unwrap_or("male");
         body(body_name)?;
         let mut melody = serde_json::json!({"bpm": bpm, "t0": t0, "lyrics": v["lyrics"], "notes": v["notes"]});
-        for k in ["vibrato", "source", "speech", "speechSource"] {
+        for k in ["vibrato", "source", "speech", "speechSource", "diphthongs", "melismaLead"] {
             if let Some(x) = v.get(k) {
                 melody[k] = x.clone();
             }
         }
-        voices.push(Voice { name: name.into(), id, body: body_name.into(), melody, gain: v["gain"].as_f64().unwrap_or(1.0), pan: v["pan"].as_f64().unwrap_or(0.0).clamp(-1.0, 1.0) });
+        // the show's pronunciations go with each melody, so `render notes` sings it the same
+        if let Some(x) = j.get("pronounce") {
+            melody["pronounce"] = x.clone();
+        }
+        let levels: Vec<[f64; 2]> = match v.get("levels") {
+            Some(x) if !x.is_null() => serde_json::from_value(x.clone()).map_err(|e| format!("{name}: levels: {e}"))?,
+            _ => Vec::new(),
+        };
+        if levels.windows(2).any(|w| w[1][0] < w[0][0]) {
+            return Err(format!("{name}: levels: the beats must not go back"));
+        }
+        let levels = levels.iter().map(|l| (t0 + l[0] * 60.0 / bpm, l[1])).collect();
+        voices.push(Voice { name: name.into(), id, body: body_name.into(), melody, gain: v["gain"].as_f64().unwrap_or(1.0), pan: v["pan"].as_f64().unwrap_or(0.0).clamp(-1.0, 1.0), levels });
     }
     if voices.is_empty() {
         return Err("a show needs a voice".into());
     }
-    let g = g2p()?;
+    let g = g2p_saying(j.get("pronounce"))?;
     let t_start = Instant::now();
     let sung: Vec<Result<Sung, String>> = std::thread::scope(|s| {
         let jobs: Vec<_> = voices.iter().map(|v| s.spawn(|| sing(&v.melody, &v.body, &g, false, true))).collect();
@@ -804,9 +861,20 @@ pub fn show(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     for (v, p) in voices.iter().zip(&parts) {
         let a = (v.pan + 1.0) * PI / 4.0;
         let (l, r) = (v.gain * cos(a), v.gain * sin(a));
+        // the voice's level over time: straight lines between its breakpoints, held outside them
+        let mut at = 0usize;
         for (i, &x) in p.out.iter().enumerate() {
-            mix[2 * i] += l * x as f64;
-            mix[2 * i + 1] += r * x as f64;
+            let t = i as f64 / FS;
+            while at < v.levels.len() && v.levels[at].0 <= t {
+                at += 1;
+            }
+            let level = match (at.checked_sub(1).map(|k| v.levels[k]), v.levels.get(at)) {
+                (Some((t0, g0)), Some(&(t1, g1))) => g0 + (g1 - g0) * (t - t0) / (t1 - t0),
+                (Some((_, g)), None) | (None, Some(&(_, g))) => g,
+                (None, None) => 1.0,
+            };
+            mix[2 * i] += l * level * x as f64;
+            mix[2 * i + 1] += r * level * x as f64;
         }
     }
     let top = mix.iter().fold(0.0f64, |p, &v| js_max(p, v.abs()));

@@ -2811,7 +2811,8 @@ input[type="range"]::-moz-range-thumb {
 
 .duet-heads {
   display: grid;
-  grid-template-columns: repeat(var(--voices, 2), minmax(0, 1fr));
+  grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr));
+  grid-auto-rows: minmax(0, 1fr);
   gap: 8px;
   min-height: 0;
 }

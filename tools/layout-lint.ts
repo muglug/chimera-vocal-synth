@@ -2,7 +2,8 @@
  * Layout lint: a smoke test of the layout. Loads every mode at phone, tablet and desktop sizes in
  * headless Chromium, before and after audio starts, then some alternate states (every encoder page,
  * every creature, the 3D face, a phrase being spoken) and the duet page (`?show=`, with a short
- * duet it renders first), and fails on mistakes screenshot reviews kept missing:
+ * duet and a sextet it renders first: one row of heads, and two), and fails on mistakes
+ * screenshot reviews kept missing:
  *
  *  - overlap     two pieces of text or controls drawn over each other (DOM text, buttons, inputs,
  *                dials, and text drawn on canvases, which the page reports by wrapping fillText)
@@ -255,6 +256,17 @@ function makeDuet(dir: string): void {
   writeFileSync(`${dir}/show.json`, JSON.stringify({ title: "A duet with a title long enough to need trimming", audio: "low.wav", bpm: 120, voices }));
 }
 
+/** Six voices for the duet page (two rows of three heads), made by `chimera render show`: the
+ *  same melody a tone apart per voice, with long names to see the heads' titles fit. */
+function makeSextet(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  const names = ["Countertenor 1", "Countertenor 2", "Tenor 1", "Tenor 2", "Baritone", "Bass"];
+  const voices = names.map((name, i) => ({ name, pan: -1 + 0.4 * i, lyrics: "la la la la", notes: [[0, 1], ...[0, 2, 4, 5].map((n) => [67 - 4 * i + n, n === 5 ? 2 : 1])] }));
+  writeFileSync(`${dir}/score.json`, JSON.stringify({ title: "A sextet", bpm: 120, t0: 0, voices }));
+  const r = Bun.spawnSync(["cargo", "run", "--quiet", "--release", "-p", "chimera-cli", "--", "render", "show", `${dir}/score.json`, dir]);
+  if (r.exitCode) throw new Error(`rendering the lint sextet: ${r.stderr.toString()}`);
+}
+
 async function main() {
   const out = arg("out") ?? "out/layout";
   rmSync(out, { recursive: true, force: true });
@@ -273,8 +285,11 @@ async function main() {
   const viewports = only ? VIEWPORTS.filter((v) => `${v.w}x${v.h}` === only).concat(VIEWPORTS.some((v) => `${v.w}x${v.h}` === only) ? [] : [{ w: +only.split("x")[0], h: +only.split("x")[1] }]) : VIEWPORTS;
   const duet = !onlyMode || onlyMode === "duet";
   const modes = onlyMode ? (onlyMode === "duet" ? [] : [onlyMode]) : MODES;
-  const duetDir = `${out}/duet-show`;
-  if (duet) makeDuet(duetDir);
+  const duetDir = `${out}/duet-show`, sextetDir = `${out}/sextet-show`;
+  if (duet) {
+    makeDuet(duetDir);
+    makeSextet(sextetDir);
+  }
 
   // WebGL through SwiftShader, for the 3D face
   const browser = await chromium.launch({ headless: true, args: ["--autoplay-policy=no-user-gesture-required", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"] });
@@ -318,6 +333,13 @@ async function main() {
       await page.locator(".duet-bar button.primary").click();
       // 1.2 s in: both heads singing, a word at each mouth
       await check("duet, playing", 1200);
+      // six voices: two rows of three heads
+      await page.route("**/shows/lint-sextet/*", (route) => route.fulfill({ path: `${sextetDir}/${basename(new URL(route.request().url()).pathname)}` }));
+      await page.goto(new URL("?show=lint-sextet", url).href, { waitUntil: "networkidle" });
+      await page.waitForSelector(".duet-head:nth-child(6) canvas", { timeout: 15000 });
+      await check("sextet", 2000);
+      await page.locator(".duet-bar button.primary").click();
+      await check("sextet, playing", 1200);
     }
     if (!modes.length) {
       await page.close();

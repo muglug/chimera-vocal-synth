@@ -1,11 +1,13 @@
 /**
  * The duet page (`?show=<id>`): a pre-rendered song with two (or more) voices, each on its own 3D
- * head, side by side, moving exactly as the engine did when it sang. Nothing is synthesized here:
- * the page plays the mixed track and replays each voice's recorded telemetry at the playhead.
+ * head, side by side (more than four: in two rows, so a sextet is three over three; in pairs on
+ * a narrow screen), moving exactly as the engine did when it sang. Nothing is synthesized here: the page plays the mixed
+ * track and replays each voice's recorded telemetry at the playhead.
  *
  * A show is a folder `public/shows/<id>/` (gitignored: shows are made locally, often of songs that
  * mustn't be published) holding `show.json`, the mix and one `.tele` per voice from
  * `chimera render notes … --tele`. The voices' renders and the mix must share sample 0.
+ * `chimera render show score.json public/shows/<id>` makes the whole folder from one file.
  *
  *   { "title": "…", "audio": "mix.mp3", "bpm": 103, "downbeat": 0,
  *     "voices": [{ "name": "Lower", "tele": "male.tele" }, { "name": "Upper", "tele": "female.tele" }] }
@@ -53,6 +55,23 @@ async function fetchOk(url: string): Promise<Response> {
   return r;
 }
 
+/** heads in a row: every voice up to four; more go in two rows, or in pairs on a narrow screen
+ *  (three columns of a phone are too narrow for a voice's name) */
+const headsPerRow = (voices: number, narrow: boolean) => (voices <= 4 ? Math.max(1, voices) : narrow ? 2 : Math.ceil(voices / 2));
+
+const NARROW = "(max-width: 720px)";
+
+function useNarrow(): boolean {
+  const [narrow, setNarrow] = useState(() => window.matchMedia(NARROW).matches);
+  useEffect(() => {
+    const m = window.matchMedia(NARROW);
+    const on = () => setNarrow(m.matches);
+    m.addEventListener("change", on);
+    return () => m.removeEventListener("change", on);
+  }, []);
+  return narrow;
+}
+
 const clock = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
 
 export function DuetPage(props: { id: string }) {
@@ -62,6 +81,7 @@ export function DuetPage(props: { id: string }) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [, setTick] = useState(0);
+  const narrow = useNarrow();
 
   useEffect(() => {
     const t = new Transport();
@@ -117,14 +137,18 @@ export function DuetPage(props: { id: string }) {
     );
   const st = transport?.state ?? { playing: false, time: 0, duration: 0, epoch: 0 };
   const title = loaded?.show.title ?? "Loading…";
+  const count = loaded?.voices.length ?? 2;
+  const cols = headsPerRow(count, narrow);
+  // the last head of a row turns to face the others
+  const facing = (i: number) => (i > 0 && (i % cols === cols - 1 || i === count - 1) ? -1 : 1);
   return (
     <div className="duet">
       <header className="duet-top">
         <span className="wordmark">Chimera</span>
         <span className="duet-title">{title}</span>
       </header>
-      <main className="duet-heads" style={{ "--voices": loaded?.voices.length ?? 2 } as React.CSSProperties}>
-        {loaded && transport ? loaded.voices.map((v, i) => <Head key={i} name={v.name} track={v.track} words={v.words} show={loaded.show} transport={transport} facing={i > 0 && i === loaded.voices.length - 1 ? -1 : 1} />) : <p className="duet-msg">Loading the song…</p>}
+      <main className="duet-heads" style={{ "--cols": cols } as React.CSSProperties}>
+        {loaded && transport ? loaded.voices.map((v, i) => <Head key={`${i} ${facing(i)}`} name={v.name} track={v.track} words={v.words} show={loaded.show} transport={transport} facing={facing(i)} />) : <p className="duet-msg">Loading the song…</p>}
       </main>
       <footer className="duet-bar">
         <button className="primary large" disabled={!loaded} onClick={() => (st.playing ? transport?.pause() : transport?.play())}>
@@ -149,7 +173,7 @@ export function DuetPage(props: { id: string }) {
   );
 }
 
-/** one voice's head; the last of several turns to face the others */
+/** one voice's head (made anew when it turns the other way: its view is built facing one side) */
 function Head(props: { name: string; track: TeleTrack; words: SungWords | null; show: ShowFile; transport: Transport; facing: 1 | -1 }) {
   const { track, show, transport, words } = props;
   const feedRef = useRef<HeadFeed | null>(null);

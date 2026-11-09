@@ -55,3 +55,18 @@ fn lyrics_words_melisma_phrase_ends_unreduced_function_words() {
     assert_eq!(syl[7].nucleus.ipa, "aɪ");
     assert!(syl[1].word_end && !syl[0].word_end);
 }
+
+/// A word with no vowel is a hum on its last nasal (or l): one syllable whose core is that
+/// consonant, with what comes before it as the onset. Without one there is nothing to sing.
+#[test]
+fn a_word_without_a_vowel_hums_on_its_last_nasal() {
+    let parts = |xs: &[&str]| {
+        let segs: Vec<Segment> = xs.iter().map(|x| Segment::new(x)).collect();
+        syllabify_segments(&segs).iter().map(|s| [ipa(&s.onset), s.nucleus.ipa.clone(), ipa(&s.coda)]).collect::<Vec<_>>()
+    };
+    assert_eq!(parts(&["d", "m"]), [["d", "m", ""].map(String::from)]);
+    assert_eq!(parts(&["m"]), [["", "m", ""].map(String::from)]);
+    assert_eq!(parts(&["h", "m", "f"]), [["h", "m", "f"].map(String::from)]);
+    assert!(parts(&["t", "p"]).is_empty());
+    assert!(parts(&["ʃ"]).is_empty());
+}

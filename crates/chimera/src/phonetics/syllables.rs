@@ -20,6 +20,9 @@ const ONSETS: &[&str] = &[
     "spl", "spɹ", "stɹ", "skɹ", "skw", "skj", "spj",
 ];
 
+/// Consonants that can be a syllable's core when a word has no vowel.
+const SYLLABIC: &[&str] = &["m", "n", "ŋ", "l", "ɫ"];
+
 /// One syllable of a word, before it gets its text.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,7 +36,13 @@ pub struct SyllableParts {
 pub fn syllabify_segments(segs: &[Segment]) -> Vec<SyllableParts> {
     let vi: Vec<usize> = segs.iter().enumerate().filter(|(_, s)| is_vowel(&s.ipa, BodyMix::MALE)).map(|(i, _)| i).collect();
     if vi.is_empty() {
-        return Vec::new();
+        // no vowel: a hum, if there is a nasal or an l to hold. The last one is the syllable's
+        // core and is sung for the note's length as a vowel would be ("mm"; "dm" is a d let go
+        // straight into a held m). Without one ("tp", "sh") there is nothing to sing.
+        return match segs.iter().rposition(|s| SYLLABIC.contains(&s.ipa.as_str())) {
+            Some(i) => vec![SyllableParts { onset: segs[..i].to_vec(), nucleus: segs[i].clone(), coda: segs[i + 1..].to_vec() }],
+            None => Vec::new(),
+        };
     }
     let mut out = Vec::new();
     let mut start = 0;

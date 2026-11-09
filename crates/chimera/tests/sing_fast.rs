@@ -277,3 +277,18 @@ fn a_consonant_can_hold_a_posture_of_its_own() {
     assert_eq!((held[0].targets.get(ArticKey::LipProt), held[0].targets.get(ArticKey::LipWidth), held[0].targets.get(ArticKey::Jaw)), (Some(0.0), Some(1.0), None));
     assert_eq!(p.gestures.len(), plain.gestures.len() + 1);
 }
+
+/// A vowel into a voiceless fricative: unless asked, the folds have parted before the consonant
+/// starts; asked, they part across its start, gently.
+#[test]
+fn devoicing_can_straddle_the_start_of_a_fricative() {
+    let (notes, _, plain) = sing("bah see", 1.0, 60.0);
+    let folds = |p: &Plan| p.gestures.iter().find(|g| g.label.as_ref().is_some_and(|l| l.as_str() == "voiceless")).cloned().unwrap();
+    let s = plain.segments.iter().find(|s| s.ipa == "s").unwrap().clone();
+    let g = folds(&plain);
+    assert!(g.t0 < s.t0 && (g.strength - 6.0).abs() < 1e-9, "plain: apart from {} (the s starts at {})", g.t0, s.t0);
+    let over = plan_song(&notes, &SongOptions { body: "male".into(), bpm: 60.0, t0: 0.5, vibrato: 0.0, devoice_over: Some(0.08), ..Default::default() });
+    let g = folds(&over);
+    // the ramp runs from 40 ms before the s to 40 ms into it
+    assert!((g.t0 - (s.t0 + 0.04)).abs() < 1e-9 && (g.ramp_in - 0.08).abs() < 1e-9 && (g.strength - 2.0).abs() < 1e-9, "from {} over {} at {}", g.t0, g.ramp_in, g.strength);
+}

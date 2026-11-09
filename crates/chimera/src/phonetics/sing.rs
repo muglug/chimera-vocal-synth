@@ -134,6 +134,12 @@ pub struct SongOptions {
     /// `{"s": {"lipProt": 0, "lipWidth": 1}}` spreads the lips for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consonant_posture: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// a voiceless fricative after a vowel: the folds part over this long (s), half of it before
+    /// the consonant starts and half after, so the voice fades under the rising hiss. None: they have
+    /// parted 15 ms before the consonant, and the voice stops dead (25 dB in 20 ms) with a gap
+    /// of 20-30 ms before the hiss; a singer's falls over 50 ms and the hiss is rising by then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devoice_over: Option<f64>,
 }
 
 /// How a held vowel's vibrato comes in: none for `delay` seconds, then growing over `over`
@@ -319,6 +325,26 @@ pub fn plan_song(notes: &[SungNote], o: &SongOptions) -> Plan {
             // blend by weight. So:
             let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
             let of = |g: &Gesture, label: &str, s: &PlannedSegment| g.label.as_ref().is_some_and(|l| l.as_str() == label) && same(g.t0, s.t0) && same(g.t1, s.t1);
+            // a vowel into a voiceless fricative: the folds' parting starts with the consonant
+            if let Some(over) = o.devoice_over {
+                for k in 1..plan.segments.len() {
+                    let (v, s) = (plan.segments[k - 1].clone(), plan.segments[k].clone());
+                    if v.kind != "vowel" || s.kind != "fricative" {
+                        continue;
+                    }
+                    // centred on the consonant's start, and no further in than 0.8 of it. At the
+                    // planner's strength of 6 the folds are fully apart a third of the way up
+                    // the ramp (the voice takes all of a gesture at weight 2); at 2 they follow it.
+                    let late = js_min(0.5 * over, 0.8 * (s.t1 - s.t0));
+                    for g in plan.gestures.iter_mut() {
+                        if g.label.as_ref().is_some_and(|l| l.as_str() == "voiceless") && same(g.t0, s.t0 - 0.015) && same(g.t1, s.t1 + 0.005) {
+                            g.t0 = s.t0 + late;
+                            g.ramp_in = over;
+                            g.strength = 2.0;
+                        }
+                    }
+                }
+            }
             // a consonant's own posture: a strong gesture over its span, so it wins over the
             // vowels' reach into the consonant
             if let Some(shapes) = &o.consonant_posture {
